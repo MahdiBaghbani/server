@@ -1,0 +1,147 @@
+# SPDX-FileCopyrightText: 2025 Nextcloud GmbH and Nextcloud contributors
+# SPDX-License-Identifier: MIT
+name: OCM integration tests
+
+on:
+  push:
+    branches: 
+      - master
+  pull_request:
+    branches: 
+      - master
+
+jobs:
+  determine-version:
+    runs-on: ubuntu-latest
+    outputs:
+      current_version: ${{ steps.get-version.outputs.version }}
+      base_version: ${{ steps.get-base.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Get current version
+        id: get-version
+        run: |
+          # Get only first 3 numbers from OC_Version array
+          version=$(php -r 'include "version.php"; echo implode(".", array_slice($OC_Version, 0, 3));')
+          echo "version=${version}" >> $GITHUB_OUTPUT
+      
+      - name: Determine base version
+        id: get-base
+        run: |
+          current_major=$(echo "${{ steps.get-version.outputs.version }}" | cut -d. -f1)
+          # List of available versions, newest first
+          versions=("30.0.2" "29.0.10" "28.0.14" "27.1.11")
+          
+          # Find matching major version or use latest
+          base_version="30.0.2"  # Default to latest
+          for ver in "${versions[@]}"; do
+            major=$(echo "$ver" | cut -d. -f1)
+            if [ "$major" = "$current_major" ]; then
+              base_version="$ver"
+              break
+            fi
+          done
+          
+          # Add v prefix for Docker image tag
+          echo "version=v${base_version}" >> $GITHUB_OUTPUT
+
+  ocm-tests:
+    needs: determine-version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        test_case: [share-with, share-link, invite-link]
+        include:
+          # Current code as sender
+          - sender: { platform: nextcloud, version: current }
+            receiver: { platform: nextcloud, version: current }
+          - sender: { platform: nextcloud, version: current }
+            receiver: { platform: nextcloud, version: v30.0.2 }
+          - sender: { platform: nextcloud, version: current }
+            receiver: { platform: nextcloud, version: v29.0.10 }
+          - sender: { platform: nextcloud, version: current }
+            receiver: { platform: nextcloud, version: v28.0.14 }
+          - sender: { platform: nextcloud, version: current }
+            receiver: { platform: nextcloud, version: v27.1.11 }
+          # Current code as receiver
+          - sender: { platform: nextcloud, version: v30.0.2 }
+            receiver: { platform: nextcloud, version: current }
+          - sender: { platform: nextcloud, version: v29.0.10 }
+            receiver: { platform: nextcloud, version: current }
+          - sender: { platform: nextcloud, version: v28.0.14 }
+            receiver: { platform: nextcloud, version: current }
+          - sender: { platform: nextcloud, version: v27.1.11 }
+            receiver: { platform: nextcloud, version: current }
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker
+        run: |
+          # Get Docker GID
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          echo "DOCKER_GID=${DOCKER_GID}" >> $GITHUB_ENV
+
+      - name: Pull dependencies
+        run: |
+          docker pull mariadb:11.4.2
+          docker pull cypress/included:13.13.1
+
+      - name: Pull stable images
+        run: |
+          if [ "${{ matrix.sender.version }}" != "current" ]; then
+            docker pull "pondersource/nextcloud:${{ matrix.sender.version }}"
+          fi
+          if [ "${{ matrix.receiver.version }}" != "current" ]; then
+            docker pull "pondersource/nextcloud:${{ matrix.receiver.version }}"
+          fi
+
+      - name: Run tests
+        run: |
+          # For sender
+          if [ "${{ matrix.sender.version }}" = "current" ]; then
+            export SENDER_MOUNT="-v ${{ github.workspace }}:/usr/src/nextcloud"
+            export SENDER_IMAGE="pondersource/nextcloud:${{ needs.determine-version.outputs.base_version }}"
+          else
+            export SENDER_MOUNT=""
+            export SENDER_IMAGE="pondersource/nextcloud:${{ matrix.sender.version }}"
+          fi
+          
+          # For receiver
+          if [ "${{ matrix.receiver.version }}" = "current" ]; then
+            export RECEIVER_MOUNT="-v ${{ github.workspace }}:/usr/src/nextcloud"
+            export RECEIVER_IMAGE="pondersource/nextcloud:${{ needs.determine-version.outputs.base_version }}"
+          else
+            export RECEIVER_MOUNT=""
+            export RECEIVER_IMAGE="pondersource/nextcloud:${{ matrix.receiver.version }}"
+          fi
+          
+          # Run test suite with Docker socket mounted
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v ${{ github.workspace }}:/ocm-test-suite \
+            --group-add ${DOCKER_GID} \
+            -e SENDER_MOUNT="${SENDER_MOUNT}" \
+            -e SENDER_IMAGE="${SENDER_IMAGE}" \
+            -e RECEIVER_MOUNT="${RECEIVER_MOUNT}" \
+            -e RECEIVER_IMAGE="${RECEIVER_IMAGE}" \
+            ghcr.io/pondersource/nextcloud-ocm-test:latest \
+            ${{ matrix.test_case }} \
+            ${{ matrix.sender.platform }} \
+            ${{ matrix.sender.version }} \
+            ci \
+            electron \
+            ${{ matrix.receiver.platform }} \
+            ${{ matrix.receiver.version }}
+
+      - name: Upload Cypress video artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ matrix.test_case }} from ${{ matrix.sender.platform }} ${{ matrix.sender.version }} to ${{ matrix.receiver.platform }} ${{ matrix.receiver.version }}
+          path: ./cypress/ocm-test-suite/cypress/videos
