@@ -12,7 +12,7 @@ on:
 
 jobs:
   build-matrix:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-xl
     outputs:
       stable_versions : ${{ steps.get-stable-versions.outputs.versions }}
       matrix          : ${{ steps.build-matrix.outputs.matrix }}
