@@ -16,6 +16,7 @@ jobs:
     outputs:
       current_version: ${{ steps.get-version.outputs.version }}
       base_version: ${{ steps.get-base.outputs.version }}
+      stable_versions: ${{ steps.get-stable-versions.outputs.versions }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -46,6 +47,13 @@ jobs:
           
           # Add v prefix for Docker image tag
           echo "version=v${base_version}" >> $GITHUB_OUTPUT
+      
+      - name: Get stable versions
+        id: get-stable-versions
+        run: |
+          # List of available versions to test against
+          versions='["v30.0.2", "v29.0.10", "v28.0.14", "v27.1.11"]'
+          echo "versions=${versions}" >> $GITHUB_OUTPUT
 
   ocm-tests:
     needs: determine-version
@@ -55,27 +63,45 @@ jobs:
       max-parallel: 4
       matrix:
         test_case: [share-with, share-link, invite-link]
-        include:
+        combination:
           # Current code as sender
-          - sender: { platform: nextcloud, version: current }
-            receiver: { platform: nextcloud, version: current }
-          - sender: { platform: nextcloud, version: current }
-            receiver: { platform: nextcloud, version: v30.0.2 }
-          - sender: { platform: nextcloud, version: current }
-            receiver: { platform: nextcloud, version: v29.0.10 }
-          - sender: { platform: nextcloud, version: current }
-            receiver: { platform: nextcloud, version: v28.0.14 }
-          - sender: { platform: nextcloud, version: current }
-            receiver: { platform: nextcloud, version: v27.1.11 }
+          - sender_platform: nextcloud
+            sender_version: current
+            receiver_platform: nextcloud
+            receiver_version: current
+          - sender_platform: nextcloud
+            sender_version: current
+            receiver_platform: nextcloud
+            receiver_version: v30.0.2
+          - sender_platform: nextcloud
+            sender_version: current
+            receiver_platform: nextcloud
+            receiver_version: v29.0.10
+          - sender_platform: nextcloud
+            sender_version: current
+            receiver_platform: nextcloud
+            receiver_version: v28.0.14
+          - sender_platform: nextcloud
+            sender_version: current
+            receiver_platform: nextcloud
+            receiver_version: v27.1.11
           # Current code as receiver
-          - sender: { platform: nextcloud, version: v30.0.2 }
-            receiver: { platform: nextcloud, version: current }
-          - sender: { platform: nextcloud, version: v29.0.10 }
-            receiver: { platform: nextcloud, version: current }
-          - sender: { platform: nextcloud, version: v28.0.14 }
-            receiver: { platform: nextcloud, version: current }
-          - sender: { platform: nextcloud, version: v27.1.11 }
-            receiver: { platform: nextcloud, version: current }
+          - sender_platform: nextcloud
+            sender_version: v30.0.2
+            receiver_platform: nextcloud
+            receiver_version: current
+          - sender_platform: nextcloud
+            sender_version: v29.0.10
+            receiver_platform: nextcloud
+            receiver_version: current
+          - sender_platform: nextcloud
+            sender_version: v28.0.14
+            receiver_platform: nextcloud
+            receiver_version: current
+          - sender_platform: nextcloud
+            sender_version: v27.1.11
+            receiver_platform: nextcloud
+            receiver_version: current
 
     steps:
       - name: Checkout
@@ -91,57 +117,70 @@ jobs:
         run: |
           docker pull mariadb:11.4.2
           docker pull cypress/included:13.13.1
-
-      - name: Pull stable images
-        run: |
-          if [ "${{ matrix.sender.version }}" != "current" ]; then
-            docker pull "pondersource/nextcloud:${{ matrix.sender.version }}"
-          fi
-          if [ "${{ matrix.receiver.version }}" != "current" ]; then
-            docker pull "pondersource/nextcloud:${{ matrix.receiver.version }}"
-          fi
+          docker pull pondersource/nextcloud-ci:latest
 
       - name: Run tests
         run: |
           # For sender
-          if [ "${{ matrix.sender.version }}" = "current" ]; then
-            export SENDER_MOUNT="-v ${{ github.workspace }}:/usr/src/nextcloud"
-            export SENDER_IMAGE="pondersource/nextcloud:${{ needs.determine-version.outputs.base_version }}"
+          if [ "${{ matrix.combination.sender_version }}" = "current" ]; then
+            # Use current code from the workspace
+            export SENDER_REPO_URL="https://github.com/${{ github.repository }}"
+            export SENDER_BRANCH="${{ github.ref_name }}"
+            export SENDER_COMMIT="${{ github.sha }}"
+            export SENDER_IMAGE="pondersource/nextcloud-ci:latest"
+            export SENDER_ENV="-e NEXTCLOUD_REPO_URL=${SENDER_REPO_URL} -e NEXTCLOUD_BRANCH=${SENDER_BRANCH} -e NEXTCLOUD_COMMIT_HASH=${SENDER_COMMIT}"
           else
-            export SENDER_MOUNT=""
-            export SENDER_IMAGE="pondersource/nextcloud:${{ matrix.sender.version }}"
+            # Use specific version from GitHub
+            export SENDER_REPO_URL="https://github.com/nextcloud/server"
+            export SENDER_BRANCH="${{ matrix.combination.sender_version }}"
+            # For stable versions, use the tag as the commit
+            export SENDER_COMMIT="${{ matrix.combination.sender_version }}"
+            export SENDER_IMAGE="pondersource/nextcloud-ci:latest"
+            export SENDER_ENV="-e NEXTCLOUD_REPO_URL=${SENDER_REPO_URL} -e NEXTCLOUD_BRANCH=${SENDER_BRANCH} -e NEXTCLOUD_COMMIT_HASH=${SENDER_COMMIT}"
           fi
           
           # For receiver
-          if [ "${{ matrix.receiver.version }}" = "current" ]; then
-            export RECEIVER_MOUNT="-v ${{ github.workspace }}:/usr/src/nextcloud"
-            export RECEIVER_IMAGE="pondersource/nextcloud:${{ needs.determine-version.outputs.base_version }}"
+          if [ "${{ matrix.combination.receiver_version }}" = "current" ]; then
+            # Use current code from the workspace
+            export RECEIVER_REPO_URL="https://github.com/${{ github.repository }}"
+            export RECEIVER_BRANCH="${{ github.ref_name }}"
+            export RECEIVER_COMMIT="${{ github.sha }}"
+            export RECEIVER_IMAGE="pondersource/nextcloud-ci:latest"
+            export RECEIVER_ENV="-e NEXTCLOUD_REPO_URL=${RECEIVER_REPO_URL} -e NEXTCLOUD_BRANCH=${RECEIVER_BRANCH} -e NEXTCLOUD_COMMIT_HASH=${RECEIVER_COMMIT}"
           else
-            export RECEIVER_MOUNT=""
-            export RECEIVER_IMAGE="pondersource/nextcloud:${{ matrix.receiver.version }}"
+            # Use specific version from GitHub
+            export RECEIVER_REPO_URL="https://github.com/nextcloud/server"
+            export RECEIVER_BRANCH="${{ matrix.combination.receiver_version }}"
+            # For stable versions, use the tag as the commit
+            export RECEIVER_COMMIT="${{ matrix.combination.receiver_version }}"
+            export RECEIVER_IMAGE="pondersource/nextcloud-ci:latest"
+            export RECEIVER_ENV="-e NEXTCLOUD_REPO_URL=${RECEIVER_REPO_URL} -e NEXTCLOUD_BRANCH=${RECEIVER_BRANCH} -e NEXTCLOUD_COMMIT_HASH=${RECEIVER_COMMIT}"
           fi
+          
+          echo "Using sender image: ${SENDER_IMAGE} with ${SENDER_ENV}"
+          echo "Using receiver image: ${RECEIVER_IMAGE} with ${RECEIVER_ENV}"
           
           # Run test suite with Docker socket mounted
           docker run --rm \
             -v /var/run/docker.sock:/var/run/docker.sock \
-            -v ${{ github.workspace }}:/ocm-test-suite \
             --group-add ${DOCKER_GID} \
-            -e SENDER_MOUNT="${SENDER_MOUNT}" \
             -e SENDER_IMAGE="${SENDER_IMAGE}" \
-            -e RECEIVER_MOUNT="${RECEIVER_MOUNT}" \
+            -e SENDER_ENV="${SENDER_ENV}" \
             -e RECEIVER_IMAGE="${RECEIVER_IMAGE}" \
+            -e RECEIVER_ENV="${RECEIVER_ENV}" \
+            -e USE_CI_IMAGE="true" \
             ghcr.io/pondersource/nextcloud-ocm-test:latest \
             ${{ matrix.test_case }} \
-            ${{ matrix.sender.platform }} \
-            ${{ matrix.sender.version }} \
+            ${{ matrix.combination.sender_platform }} \
+            ${{ matrix.combination.sender_version }} \
             ci \
             electron \
-            ${{ matrix.receiver.platform }} \
-            ${{ matrix.receiver.version }}
+            ${{ matrix.combination.receiver_platform }} \
+            ${{ matrix.combination.receiver_version }}
 
       - name: Upload Cypress video artifacts
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ matrix.test_case }} from ${{ matrix.sender.platform }} ${{ matrix.sender.version }} to ${{ matrix.receiver.platform }} ${{ matrix.receiver.version }}
+          name: ${{ matrix.test_case }} from ${{ matrix.combination.sender_platform }} ${{ matrix.combination.sender_version }} to ${{ matrix.combination.receiver_platform }} ${{ matrix.combination.receiver_version }}
           path: ./cypress/ocm-test-suite/cypress/videos

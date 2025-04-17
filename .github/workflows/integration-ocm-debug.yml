@@ -12,7 +12,7 @@ on:
 
 jobs:
   build-matrix:
-    runs-on: ubuntu-latest-xl
+    runs-on: ubuntu-latest
     outputs:
       stable_versions : ${{ steps.get-stable-versions.outputs.versions }}
       matrix          : ${{ steps.build-matrix.outputs.matrix }}
@@ -74,7 +74,7 @@ jobs:
 
   ocm-tests:
     needs: build-matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-xl
     strategy:
       fail-fast: false
       max-parallel: 1
