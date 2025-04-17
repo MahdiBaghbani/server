@@ -44,7 +44,7 @@ jobs:
           json=$(printf '%s\n' "${versions[@]}" | jq -Rsc 'split("\n")[:-1]')
           echo "versions=${json}" >> "$GITHUB_OUTPUT"
 
-          echo "📝  Stable versions detected:"
+          echo "Stable versions detected:"
           echo "$json" | jq .
 
       # Expand that list into the sender/receiver matrix
@@ -56,6 +56,11 @@ jobs:
         run: |
           readarray -t arr < <(jq -r '.[]' <<<"$STABLE_VERSIONS")
           combos=()
+
+          # current - current  (self test)
+          combos+=('{"sender_platform":"nextcloud","sender_version":"current","receiver_platform":"nextcloud","receiver_version":"current"}')
+
+          # current - stable  (upgrade / downgrade)
           for v in "${arr[@]}"; do
             combos+=("{\"sender_platform\":\"nextcloud\",\"sender_version\":\"current\",\"receiver_platform\":\"nextcloud\",\"receiver_version\":\"${v}\"}")
             combos+=("{\"sender_platform\":\"nextcloud\",\"sender_version\":\"${v}\",\"receiver_platform\":\"nextcloud\",\"receiver_version\":\"current\"}")
@@ -63,6 +68,59 @@ jobs:
           matrix_json="[$(IFS=','; echo "${combos[*]}")]"
           echo "matrix=${matrix_json}" >> "$GITHUB_OUTPUT"
 
-          echo "📝  Combination matrix (truncated to first 1 kB):"
+          echo "Combination matrix (truncated to first 1  kB):"
           echo "$matrix_json" | jq . | head -c 1024
           [ $(echo "$matrix_json" | wc -c) -gt 1024 ] && echo -e "\n…(truncated)…"
+
+  ocm-tests:
+    needs: build-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        test_case : [ share-with ]
+        combination: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Detect Docker GID
+      run: echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> "$GITHUB_ENV"
+
+    - name: Pull images
+      run: |
+        docker pull mariadb:11.4.2
+        docker pull cypress/included:13.13.1
+        docker pull pondersource/nextcloud-ci:latest
+
+    - name: Run ${{ matrix.test_case }}
+      env:
+        SENDER_PLATFORM:   ${{ matrix.combination.sender_platform }}
+        SENDER_VERSION:    ${{ matrix.combination.sender_version }}
+        RECEIVER_PLATFORM: ${{ matrix.combination.receiver_platform }}
+        RECEIVER_VERSION:  ${{ matrix.combination.receiver_version }}
+      shell: bash
+      run: |
+        make_env () {
+          if [ "$2" = "current" ]; then
+            echo "-e NEXTCLOUD_REPO_URL=https://github.com/${{ github.repository }} -e NEXTCLOUD_COMMIT_HASH=${{ github.sha }}"
+          else
+            echo "-e NEXTCLOUD_REPO_URL=https://github.com/nextcloud/server -e NEXTCLOUD_TAG=$2"
+          fi
+        }
+
+        SENDER_ENV=$(make_env SENDER  "$SENDER_VERSION")
+        RECEIVER_ENV=$(make_env RECEIVER "$RECEIVER_VERSION")
+
+        docker run --rm \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          --group-add "$DOCKER_GID" \
+          -e USE_CI_IMAGE=true \
+          -e SENDER_ENV="$SENDER_ENV" \
+          -e RECEIVER_ENV="$RECEIVER_ENV" \
+          pondersource/dev-stock:latest \
+          ${{ matrix.test_case }} \
+          "$SENDER_PLATFORM"  "$SENDER_VERSION" \
+          ci electron \
+          "$RECEIVER_PLATFORM" "$RECEIVER_VERSION"
