@@ -11,55 +11,58 @@ on:
       - master
 
 jobs:
-# ────────────────────────────────────────────────────────────────────────────────
-  determine-version:
+  build-matrix:
     runs-on: ubuntu-latest
     outputs:
-      current_version : ${{ steps.get-version.outputs.version }}
-      base_version    : ${{ steps.get-base.outputs.version }}
       stable_versions : ${{ steps.get-stable-versions.outputs.versions }}
-      matrix          : ${{ steps.build-matrix.outputs.matrix }}   # NEW
+      matrix          : ${{ steps.build-matrix.outputs.matrix }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Get current version
-        id: get-version
-        run: |
-          version=$(php -r 'include "version.php"; echo implode(".", array_slice($OC_Version, 0, 3));')
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-
-      - name: Determine base version
-        id: get-base
-        run: |
-          current_major=$(echo "${{ steps.get-version.outputs.version }}" | cut -d. -f1)
-          versions=("30.0.2" "29.0.10" "28.0.14" "27.1.11")
-          base_version="30.0.2"
-          for ver in "${versions[@]}"; do
-            [ "$(echo "$ver" | cut -d. -f1)" = "$current_major" ] && base_version="$ver" && break
-          done
-          echo "version=v${base_version}" >> "$GITHUB_OUTPUT"
-
-      - name: Get stable versions
+      # Grab the latest patch tag for every major ≥ 27
+      - name: Get stable versions (majors ≥ 27)
         id: get-stable-versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          versions='["v30.0.2","v29.0.10","v28.0.14","v27.1.11"]'
-          echo "versions=${versions}" >> "$GITHUB_OUTPUT"
+          tags=$(gh api 'repos/nextcloud/server/tags?per_page=100' --paginate \
+                  --jq '.[].name' |
+                 grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' |
+                 sed 's/^v//' |
+                 sort -Vr)
 
-      # ── NEW: build full sender/receiver permutation matrix ────────────────────
-      - name: Build matrix JSON
+          majors_seen=()
+          versions=()
+
+          while read -r tag; do
+            major="${tag%%.*}"
+            if (( major >= 27 )) && [[ ! " ${majors_seen[*]} " =~ " ${major} " ]]; then
+              versions+=( "v${tag}" )
+              majors_seen+=( "${major}" )
+            fi
+          done <<< "$tags"
+
+          json=$(printf '%s\n' "${versions[@]}" | jq -Rsc 'split("\n")[:-1]')
+          echo "versions=${json}" >> "$GITHUB_OUTPUT"
+
+          echo "📝  Stable versions detected:"
+          echo "$json" | jq .
+
+      # Expand that list into the sender/receiver matrix
+      - name: Build sender/receiver matrix
         id: build-matrix
         env:
           STABLE_VERSIONS: ${{ steps.get-stable-versions.outputs.versions }}
         shell: bash
         run: |
-          readarray -t arr < <(jq -r '.[]' <<<"${STABLE_VERSIONS}")
+          readarray -t arr < <(jq -r '.[]' <<<"$STABLE_VERSIONS")
           combos=()
           for v in "${arr[@]}"; do
-            # current → stable
             combos+=("{\"sender_platform\":\"nextcloud\",\"sender_version\":\"current\",\"receiver_platform\":\"nextcloud\",\"receiver_version\":\"${v}\"}")
-            # stable → current
             combos+=("{\"sender_platform\":\"nextcloud\",\"sender_version\":\"${v}\",\"receiver_platform\":\"nextcloud\",\"receiver_version\":\"current\"}")
           done
           matrix_json="[$(IFS=','; echo "${combos[*]}")]"
           echo "matrix=${matrix_json}" >> "$GITHUB_OUTPUT"
+
+          echo "📝  Combination matrix (truncated to first 1 kB):"
+          echo "$matrix_json" | jq . | head -c 1024
+          [ $(echo "$matrix_json" | wc -c) -gt 1024 ] && echo -e "\n…(truncated)…"
