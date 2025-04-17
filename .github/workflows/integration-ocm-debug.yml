@@ -123,5 +123,5 @@ jobs:
           pondersource/dev-stock:latest \
           ${{ matrix.test_case }} \
           "$SENDER_PLATFORM"  "$SENDER_VERSION" \
-          ci electron \
+          dev electron \
           "$RECEIVER_PLATFORM" "$RECEIVER_VERSION"
