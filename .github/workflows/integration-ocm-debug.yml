@@ -77,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 1
       matrix:
         test_case : [ share-with ]
         combination: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
@@ -92,6 +92,7 @@ jobs:
       run: |
         docker pull mariadb:11.4.2
         docker pull cypress/included:13.13.1
+        docker pull pondersource/dev-stock:latest
         docker pull pondersource/nextcloud-ci:latest
 
     - name: Run ${{ matrix.test_case }}
