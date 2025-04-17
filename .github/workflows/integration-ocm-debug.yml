@@ -125,3 +125,7 @@ jobs:
           "$SENDER_PLATFORM"  "$SENDER_VERSION" \
           dev electron \
           "$RECEIVER_PLATFORM" "$RECEIVER_VERSION"
+    
+    - name: Dump OOM report
+      if: failure()
+      run: dmesg | grep -i -E 'killed process|out of memory' || true
