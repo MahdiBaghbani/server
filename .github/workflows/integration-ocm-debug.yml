@@ -16,9 +16,31 @@ jobs:
     outputs:
       stable_versions : ${{ steps.get-stable-versions.outputs.versions }}
       matrix          : ${{ steps.build-matrix.outputs.matrix }}
+      current_version : ${{ steps.current-ver.outputs.version }}
+
     steps:
-      # Grab the latest patch tag for every major ≥ 27
-      - name: Get stable versions (majors ≥ 27)
+      # access version.php
+      - uses: actions/checkout@v4
+      - name: Install GitHub CLI + jq
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gh jq
+
+      - name: Derive current Nextcloud version
+        id: current-ver
+        shell: bash
+        run: |
+          # Extract first three numbers from the OC_Version array in version.php
+          ver=$(grep -Eo '\$OC_Version\s*=\s*\[[^]]+' version.php |
+                grep -Eo '[0-9]+' | head -n 3 | paste -sd'.' -)
+
+          if [[ ! $ver =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Could not parse version.php (got \"$ver\")"
+            exit 1
+          fi
+
+          echo "version=v${ver}" >> "$GITHUB_OUTPUT"
+          echo "Detected Nextcloud version: v${ver}"
+
+      - name: Get stable versions (majors ≥ 27)
         id: get-stable-versions
         env:
           GH_TOKEN: ${{ github.token }}
@@ -47,7 +69,6 @@ jobs:
           echo "Stable versions detected:"
           echo "$json" | jq .
 
-      # Expand that list into the sender/receiver matrix
       - name: Build sender/receiver matrix
         id: build-matrix
         env:
@@ -73,59 +94,59 @@ jobs:
           [ $(echo "$matrix_json" | wc -c) -gt 1024 ] && echo -e "\n…(truncated)…"
 
   ocm-tests:
-    needs: build-matrix
-    runs-on: ubuntu-latest-xl
+    needs: 
+      - "build-matrix"
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_case : [ share-with ]
         combination: ${{ fromJson(needs.build-matrix.outputs.matrix) }}
+    env:
+      CURRENT_VERSION: ${{ needs.build-matrix.outputs.current_version }}
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Pull images
+        run: |
+          docker pull mariadb:11.4.4
+          docker pull pondersource/cypress:latest
+          docker pull pondersource/dev-stock:latest
+          docker pull pondersource/nextcloud-ci:latest
 
-    - name: Detect Docker GID
-      run: echo "DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)" >> "$GITHUB_ENV"
+      - name: Run ${{ matrix.test_case }}
+        env:
+          SENDER_PLATFORM:   ${{ matrix.combination.sender_platform }}
+          SENDER_VERSION:    ${{ matrix.combination.sender_version }}
+          RECEIVER_PLATFORM: ${{ matrix.combination.receiver_platform }}
+          RECEIVER_VERSION:  ${{ matrix.combination.receiver_version }}
+        shell: bash
+        run: |
+          make_env() {
+            if [ "$1" = "current" ]; then
+              printf -- '-e NEXTCLOUD_REPO_URL=%s -e NEXTCLOUD_COMMIT_HASH=%s' \
+                      "https://github.com/${{ github.repository }}" "${{ github.sha }}"
+            else
+              printf -- '-e NEXTCLOUD_REPO_URL=https://github.com/nextcloud/server -e NEXTCLOUD_TAG=%s' "$1"
+            fi
+          }
 
-    - name: Pull images
-      run: |
-        docker pull mariadb:11.4.2
-        docker pull cypress/included:13.13.1
-        docker pull pondersource/dev-stock:latest
-        docker pull pondersource/nextcloud-ci:latest
+          SENDER_ENV=$(make_env "$SENDER_VERSION")
+          RECEIVER_ENV=$(make_env "$RECEIVER_VERSION")
 
-    - name: Run ${{ matrix.test_case }}
-      env:
-        SENDER_PLATFORM:   ${{ matrix.combination.sender_platform }}
-        SENDER_VERSION:    ${{ matrix.combination.sender_version }}
-        RECEIVER_PLATFORM: ${{ matrix.combination.receiver_platform }}
-        RECEIVER_VERSION:  ${{ matrix.combination.receiver_version }}
-      shell: bash
-      run: |
-        make_env () {
-          if [ "$2" = "current" ]; then
-            echo "-e NEXTCLOUD_REPO_URL=https://github.com/${{ github.repository }} -e NEXTCLOUD_COMMIT_HASH=${{ github.sha }}"
-          else
-            echo "-e NEXTCLOUD_REPO_URL=https://github.com/nextcloud/server -e NEXTCLOUD_TAG=$2"
-          fi
-        }
+          # translate placeholder 'current' to real vX.Y.Z
+          [[ $SENDER_VERSION   == "current" ]] && SENDER_VER_ARG="$CURRENT_VERSION"   || SENDER_VER_ARG="$SENDER_VERSION"
+          [[ $RECEIVER_VERSION == "current" ]] && RECEIVER_VER_ARG="$CURRENT_VERSION" || RECEIVER_VER_ARG="$RECEIVER_VERSION"
 
-        SENDER_ENV=$(make_env SENDER  "$SENDER_VERSION")
-        RECEIVER_ENV=$(make_env RECEIVER "$RECEIVER_VERSION")
-
-        docker run --rm \
-          -v /var/run/docker.sock:/var/run/docker.sock \
-          --group-add "$DOCKER_GID" \
-          -e USE_CI_IMAGE=true \
-          -e SENDER_ENV="$SENDER_ENV" \
-          -e RECEIVER_ENV="$RECEIVER_ENV" \
-          pondersource/dev-stock:latest \
-          ${{ matrix.test_case }} \
-          "$SENDER_PLATFORM"  "$SENDER_VERSION" \
-          dev electron \
-          "$RECEIVER_PLATFORM" "$RECEIVER_VERSION"
-    
-    - name: Dump OOM report
-      if: failure()
-      run: dmesg | grep -i -E 'killed process|out of memory' || true
+          docker run --rm \
+            --name="dev-stock-${GITHUB_RUN_ID}-${GITHUB_JOB}" \
+            -e CI_ENVIRONMENT=true \
+            -e DEVSTOCK_DEBUG=true \
+            -e SENDER_ENV="$SENDER_ENV" \
+            -e RECEIVER_ENV="$RECEIVER_ENV" \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            pondersource/dev-stock:latest \
+            ${{ matrix.test_case }} \
+            "$SENDER_PLATFORM"  "$SENDER_VER_ARG" \
+            ci electron \
+            "$RECEIVER_PLATFORM" "$RECEIVER_VER_ARG"
