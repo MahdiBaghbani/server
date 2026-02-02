@@ -334,6 +334,25 @@ class DAV extends Common {
 	}
 
 	/**
+	 * Check if bearer authentication is being used
+	 */
+	protected function isBearerAuth(): bool {
+		return $this->authType !== null &&
+		       ($this->authType & BearerAuthAwareSabreClient::AUTH_BEARER);
+	}
+
+	/**
+	 * Reinitialize the client with a fresh access token
+	 * Used when the current bearer token has expired (401 response)
+	 */
+	protected function reinitWithFreshToken(): void {
+		$this->logger->debug('Bearer token expired, refreshing token', ['app' => 'dav']);
+		$this->ready = false;
+		$this->password = '';  // Clear to force token exchange in init()
+		$this->init();
+	}
+
+	/**
 	 * Clear the stat cache
 	 */
 	public function clearStatCache(): void {
@@ -425,12 +444,13 @@ class DAV extends Common {
 	 * If not, request it from the server then store to cache.
 	 *
 	 * @param string $path path to propfind
+	 * @param bool $retryOnUnauthorized whether to retry on 401 response (used to prevent infinite loops)
 	 *
 	 * @return array|false propfind response or false if the entry was not found
 	 *
 	 * @throws ClientHttpException
 	 */
-	protected function propfind(string $path): array|false {
+	protected function propfind(string $path, bool $retryOnUnauthorized = true): array|false {
 		$path = $this->cleanPath($path);
 		$cachedResponse = $this->statCache->get($path);
 		// we either don't know it, or we know it exists but need more details
@@ -447,6 +467,9 @@ class DAV extends Common {
 				if ($e->getHttpStatus() === 404 || $e->getHttpStatus() === 405) {
 					$this->statCache->clear($path . '/');
 					$this->statCache->set($path, false);
+				} elseif ($e->getHttpStatus() === 401 && $retryOnUnauthorized && $this->isBearerAuth()) {
+					$this->reinitWithFreshToken();
+					return $this->propfind($path, false);
 				} else {
 					$this->convertException($e, $path);
 				}
@@ -504,7 +527,7 @@ class DAV extends Common {
 		return $result;
 	}
 
-	public function fopen(string $path, string $mode) {
+	public function fopen(string $path, string $mode, bool $retryOnUnauthorized = true) {
 		$this->init();
 		$path = $this->cleanPath($path);
 		switch ($mode) {
@@ -531,6 +554,11 @@ class DAV extends Common {
 					if ($e->getResponse() instanceof ResponseInterface
 						&& $e->getResponse()->getStatusCode() === 404) {
 						return false;
+					} elseif ($e->getResponse() instanceof ResponseInterface
+						&& $e->getResponse()->getStatusCode() === 401
+						&& $retryOnUnauthorized && $this->isBearerAuth()) {
+						$this->reinitWithFreshToken();
+						return $this->fopen($path, $mode, false);
 					} else {
 						throw $e;
 					}
@@ -617,7 +645,7 @@ class DAV extends Common {
 		}
 	}
 
-	public function touch(string $path, ?int $mtime = null): bool {
+	public function touch(string $path, ?int $mtime = null, bool $retryOnUnauthorized = true): bool {
 		$this->init();
 		if (is_null($mtime)) {
 			$mtime = time();
@@ -642,6 +670,10 @@ class DAV extends Common {
 				if ($e->getHttpStatus() === 501) {
 					return false;
 				}
+				if ($e->getHttpStatus() === 401 && $retryOnUnauthorized && $this->isBearerAuth()) {
+					$this->reinitWithFreshToken();
+					return $this->touch($path, $mtime, false);
+				}
 				$this->convertException($e, $path);
 				return false;
 			} catch (\Exception $e) {
@@ -661,7 +693,7 @@ class DAV extends Common {
 		return $result;
 	}
 
-	protected function uploadFile(string $path, string $target): void {
+	protected function uploadFile(string $path, string $target, bool $retryOnUnauthorized = true): void {
 		$this->init();
 
 		// invalidate
@@ -675,21 +707,32 @@ class DAV extends Common {
 			$auth = [];
 			$headers = ['Authorization' => 'Bearer ' . $this->bearerToken];
 		}
-		$this->httpClientService
-			->newClient()
-			->put($this->createBaseUri() . $this->encodePath($target), [
-				'body' => $source,
-				'headers' => $headers,
-				'auth' => $auth,
-				// set upload timeout for users with slow connections or large files
-				'timeout' => $this->timeout,
-				'verify' => $this->verify,
-			]);
+		try {
+			$this->httpClientService
+				->newClient()
+				->put($this->createBaseUri() . $this->encodePath($target), [
+					'body' => $source,
+					'headers' => $headers,
+					'auth' => $auth,
+					// set upload timeout for users with slow connections or large files
+					'timeout' => $this->timeout,
+					'verify' => $this->verify,
+				]);
+		} catch (\GuzzleHttp\Exception\ClientException $e) {
+			if ($e->getResponse() instanceof ResponseInterface
+				&& $e->getResponse()->getStatusCode() === 401
+				&& $retryOnUnauthorized && $this->isBearerAuth()) {
+				$this->reinitWithFreshToken();
+				$this->uploadFile($path, $target, false);
+				return;
+			}
+			throw $e;
+		}
 
 		$this->removeCachedFile($target);
 	}
 
-	public function rename(string $source, string $target): bool {
+	public function rename(string $source, string $target, bool $retryOnUnauthorized = true): bool {
 		$this->init();
 		$source = $this->cleanPath($source);
 		$target = $this->cleanPath($target);
@@ -714,13 +757,19 @@ class DAV extends Common {
 			$this->removeCachedFile($source);
 			$this->removeCachedFile($target);
 			return true;
+		} catch (ClientHttpException $e) {
+			if ($e->getHttpStatus() === 401 && $retryOnUnauthorized && $this->isBearerAuth()) {
+				$this->reinitWithFreshToken();
+				return $this->rename($source, $target, false);
+			}
+			$this->convertException($e);
 		} catch (\Exception $e) {
 			$this->convertException($e);
 		}
 		return false;
 	}
 
-	public function copy(string $source, string $target): bool {
+	public function copy(string $source, string $target, bool $retryOnUnauthorized = true): bool {
 		$this->init();
 		$source = $this->cleanPath($source);
 		$target = $this->cleanPath($target);
@@ -742,6 +791,12 @@ class DAV extends Common {
 			$this->statCache->set($target, true);
 			$this->removeCachedFile($target);
 			return true;
+		} catch (ClientHttpException $e) {
+			if ($e->getHttpStatus() === 401 && $retryOnUnauthorized && $this->isBearerAuth()) {
+				$this->reinitWithFreshToken();
+				return $this->copy($source, $target, false);
+			}
+			$this->convertException($e);
 		} catch (\Exception $e) {
 			$this->convertException($e);
 		}
@@ -842,11 +897,12 @@ class DAV extends Common {
 	}
 
 	/**
+	 * @param bool $retryOnUnauthorized whether to retry on 401 response (used to prevent infinite loops)
 	 * @return bool
 	 * @throws StorageInvalidException
 	 * @throws StorageNotAvailableException
 	 */
-	protected function simpleResponse(string $method, string $path, ?string $body, int $expected): bool {
+	protected function simpleResponse(string $method, string $path, ?string $body, int $expected, bool $retryOnUnauthorized = true): bool {
 		$path = $this->cleanPath($path);
 		try {
 			$response = $this->client->request($method, $this->encodePath($path), $body);
@@ -856,6 +912,11 @@ class DAV extends Common {
 				$this->statCache->clear($path . '/');
 				$this->statCache->set($path, false);
 				return false;
+			}
+
+			if ($e->getHttpStatus() === 401 && $retryOnUnauthorized && $this->isBearerAuth()) {
+				$this->reinitWithFreshToken();
+				return $this->simpleResponse($method, $path, $body, $expected, false);
 			}
 
 			$this->convertException($e, $path);
@@ -1014,7 +1075,7 @@ class DAV extends Common {
 		// TODO: only log for now, but in the future need to wrap/rethrow exception
 	}
 
-	public function getDirectoryContent(string $directory): \Traversable {
+	public function getDirectoryContent(string $directory, bool $retryOnUnauthorized = true): \Traversable {
 		$this->init();
 		$directory = $this->cleanPath($directory);
 		try {
@@ -1036,6 +1097,13 @@ class DAV extends Common {
 				$this->statCache->set($file, $response);
 				yield $this->getMetaFromPropfind($file, $response);
 			}
+		} catch (ClientHttpException $e) {
+			if ($e->getHttpStatus() === 401 && $retryOnUnauthorized && $this->isBearerAuth()) {
+				$this->reinitWithFreshToken();
+				yield from $this->getDirectoryContent($directory, false);
+				return;
+			}
+			$this->convertException($e, $directory);
 		} catch (\Exception $e) {
 			$this->convertException($e, $directory);
 		}
