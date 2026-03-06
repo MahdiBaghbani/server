@@ -55,7 +55,7 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	private bool $tokenRefreshed = false;
 
 	/**
-	 * @param array{HttpClientService: IClientService, manager: ExternalShareManager, cloudId: ICloudId, mountpoint: string, token: string, password: ?string}|array $options
+	 * @param array{HttpClientService: IClientService, manager: ExternalShareManager, cloudId: ICloudId, mountpoint: string, token: string, access_token: ?string}|array $options
 	 */
 	public function __construct($options) {
 		$this->memcacheFactory = Server::get(ICacheFactory::class);
@@ -85,9 +85,9 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$authType = \Sabre\DAV\Client::AUTH_BASIC;
 		}
 
-		// If we have a stored access token (password), use Bearer auth regardless of discovery
-		// This handles the case where the share was created with must-exchange-token
-		if (!empty($options['password'])) {
+		// If we have a stored access token, use Bearer auth regardless of discovery.
+		// This handles the case where the share was created with must-exchange-token.
+		if (!empty($options['access_token'])) {
 			$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
 		}
 
@@ -112,7 +112,9 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 				'root' => $webDavEndpoint,
 				'user' => $options['token'],
 				'authType' => $authType,
-				'password' => (string)$options['password'],
+				'password' => $authType === \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER
+					? (string)($options['access_token'] ?? '')
+					: (string)($options['password'] ?? ''),
 				'discoveryService' => $discoveryService,
 			]
 		);
