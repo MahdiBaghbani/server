@@ -139,6 +139,20 @@ class TokenController extends ApiController {
 				);
 			}
 
+			// Revoke the previous access token for this refresh token, if any.
+			$existingMapping = $this->ocmTokenMapMapper->findByRefreshToken($refreshToken);
+			if ($existingMapping !== null) {
+				try {
+					$this->tokenProvider->invalidateTokenById(
+						$token->getUID(),
+						$existingMapping->getAccessTokenId()
+					);
+				} catch (\Exception) {
+					// Token may already be gone; ignore.
+				}
+				$this->ocmTokenMapMapper->delete($existingMapping);
+			}
+
 			$accessTokenString = $this->random->generate(
 				64,
 				ISecureRandom::CHAR_UPPER . ISecureRandom::CHAR_LOWER . ISecureRandom::CHAR_DIGITS
