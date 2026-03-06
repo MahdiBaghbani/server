@@ -113,6 +113,7 @@ class Manager {
 			'remote' => $externalShare->getRemote(),
 			'token' => $externalShare->getShareToken(),
 			'password' => $externalShare->getPassword(),
+			'access_token' => $externalShare->getAccessToken(),
 			'mountpoint' => $externalShare->getMountpoint(),
 			'owner' => $externalShare->getOwner(),
 			'verify' => !$this->config->getSystemValueBool('sharing.federation.allowSelfSignedCertificates'),
@@ -190,6 +191,7 @@ class Manager {
 				$subShare->generateId();
 				$subShare->setRemote($externalShare->getRemote());
 				$subShare->setPassword($externalShare->getPassword());
+				$subShare->setAccessToken($externalShare->getAccessToken());
 				$subShare->setName($externalShare->getName());
 				$subShare->setOwner($externalShare->getOwner());
 				$subShare->setUser($user->getUID());
@@ -576,7 +578,7 @@ class Manager {
 	public function updateAccessToken(string $shareToken, string $accessToken): void {
 		try {
 			$share = $this->externalShareMapper->getShareByToken($shareToken);
-			$share->setPassword($accessToken);
+			$share->setAccessToken($accessToken);
 			$this->externalShareMapper->update($share);
 			$this->logger->debug('Updated access token for share', ['shareToken' => substr($shareToken, 0, 8) . '...']);
 		} catch (DoesNotExistException $e) {
