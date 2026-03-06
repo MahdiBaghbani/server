@@ -114,6 +114,7 @@ class Manager {
 			'token' => $externalShare->getShareToken(),
 			'password' => $externalShare->getPassword(),
 			'access_token' => $externalShare->getAccessToken(),
+			'access_token_expires' => $externalShare->getAccessTokenExpires(),
 			'mountpoint' => $externalShare->getMountpoint(),
 			'owner' => $externalShare->getOwner(),
 			'verify' => !$this->config->getSystemValueBool('sharing.federation.allowSelfSignedCertificates'),
@@ -575,10 +576,11 @@ class Manager {
 	 * @param string $shareToken The share token (refresh token) to identify the share
 	 * @param string $accessToken The new access token to store
 	 */
-	public function updateAccessToken(string $shareToken, string $accessToken): void {
+	public function updateAccessToken(string $shareToken, string $accessToken, int $expiresAt): void {
 		try {
 			$share = $this->externalShareMapper->getShareByToken($shareToken);
 			$share->setAccessToken($accessToken);
+			$share->setAccessTokenExpires($expiresAt);
 			$this->externalShareMapper->update($share);
 			$this->logger->debug('Updated access token for share', ['shareToken' => substr($shareToken, 0, 8) . '...']);
 		} catch (DoesNotExistException $e) {
