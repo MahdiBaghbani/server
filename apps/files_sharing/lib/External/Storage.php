@@ -55,6 +55,13 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	private bool $tokenRefreshed = false;
 	/** Unix timestamp until which the current access token is considered valid (0 = unknown/expired) */
 	private int $tokenExpiresAt = 0;
+	/** Number of consecutive token exchange failures (resets on success or DB-reuse) */
+	private int $refreshFailureCount = 0;
+	/** Unix timestamp before which the next exchange attempt must not be made (0 = no wait) */
+	private int $refreshBackoffUntil = 0;
+
+	private const REFRESH_MAX_ATTEMPTS = 3;
+	private const REFRESH_BACKOFF_SECONDS = 5;
 
 	/**
 	 * @param array{HttpClientService: IClientService, manager: ExternalShareManager, cloudId: ICloudId, mountpoint: string, token: string, access_token: ?string, access_token_expires: ?int}|array $options
@@ -130,6 +137,11 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	 * processes can detect that another process already obtained a fresh token
 	 * and reuse it rather than performing a redundant exchange.
 	 *
+	 * After a failed exchange, a 60-second backoff is applied so that
+	 * subsequent file operations do not hammer the remote token endpoint.
+	 * The DB is still consulted during backoff in case a concurrent process
+	 * succeeded; only the outgoing exchange call is suppressed.
+	 *
 	 * @return bool True if token was refreshed (or reused from DB) successfully
 	 */
 	protected function refreshBearerToken(): bool {
@@ -146,9 +158,11 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$dbExpiry = $share->getAccessTokenExpires();
 			$dbToken = $share->getAccessToken();
 			if ($dbExpiry !== null && $dbExpiry > $now && $dbToken !== null) {
-				// Another process already refreshed — reuse DB token.
+				// Another process already refreshed — reuse DB token and reset failure state.
 				$this->password = $dbToken;
 				$this->tokenExpiresAt = $dbExpiry;
+				$this->refreshFailureCount = 0;
+				$this->refreshBackoffUntil = 0;
 				$this->ready = false;
 				$this->client = null;
 				$this->init();
@@ -157,12 +171,24 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			}
 		}
 
+		// Gave up after max attempts: stop trying for the lifetime of this instance.
+		if ($this->refreshFailureCount >= self::REFRESH_MAX_ATTEMPTS) {
+			return false;
+		}
+
+		// Still within the inter-attempt wait: don't hit the endpoint yet.
+		if ($this->refreshBackoffUntil > $now) {
+			return false;
+		}
+
 		// No valid token in DB — perform the exchange ourselves.
 		try {
 			$expiresAt = $now + 3600; // access tokens are valid for 1 hour
 			$newAccessToken = $this->exchangeRefreshToken();
 			$this->password = $newAccessToken;
 			$this->tokenExpiresAt = $expiresAt;
+			$this->refreshFailureCount = 0;
+			$this->refreshBackoffUntil = 0;
 
 			$this->manager->updateAccessToken($this->token, $newAccessToken, $expiresAt);
 
@@ -173,8 +199,12 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$this->logger->debug('Successfully refreshed access token', ['app' => 'files_sharing']);
 			return true;
 		} catch (\Exception $e) {
-			$this->logger->warning('Failed to refresh access token', [
+			$this->refreshFailureCount++;
+			$this->refreshBackoffUntil = $now + self::REFRESH_BACKOFF_SECONDS;
+			$this->logger->warning('Failed to refresh access token (attempt {attempt}/{max})', [
 				'app' => 'files_sharing',
+				'attempt' => $this->refreshFailureCount,
+				'max' => self::REFRESH_MAX_ATTEMPTS,
 				'exception' => $e,
 			]);
 			return false;
