@@ -50,7 +50,7 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	private bool $updateChecked = false;
 	private ExternalShareManager $manager;
 	private IConfig $config;
-	private IAppConfig $appConfig;
+	protected IAppConfig $appConfig;
 	private IShareManager $shareManager;
 	private bool $tokenRefreshed = false;
 	/** Unix timestamp until which the current access token is considered valid (0 = unknown/expired) */
