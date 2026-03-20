@@ -69,6 +69,36 @@ class BearerAuthTest extends TestCase {
 		$this->assertSame('principals/users/admin', $this->bearerAuth->validateBearerToken('Token'));
 	}
 
+	public function testValidateBearerTokenFallbackToDoTryTokenLogin(): void {
+		// First two isLoggedIn() calls return false (tryTokenLogin did not log in),
+		// then doTryTokenLogin succeeds and the third call returns true.
+		$this->userSession
+			->expects($this->exactly(3))
+			->method('isLoggedIn')
+			->willReturnOnConsecutiveCalls(false, false, true);
+
+		$this->userSession
+			->expects($this->once())
+			->method('tryTokenLogin')
+			->with($this->request);
+
+		$this->userSession
+			->expects($this->once())
+			->method('doTryTokenLogin')
+			->with('BearerToken');
+
+		$user = $this->createMock(IUser::class);
+		$user->expects($this->once())
+			->method('getUID')
+			->willReturn('admin');
+		$this->userSession
+			->expects($this->once())
+			->method('getUser')
+			->willReturn($user);
+
+		$this->assertSame('principals/users/admin', $this->bearerAuth->validateBearerToken('BearerToken'));
+	}
+
 	public function testChallenge(): void {
 		/** @var RequestInterface&MockObject $request */
 		$request = $this->createMock(RequestInterface::class);
