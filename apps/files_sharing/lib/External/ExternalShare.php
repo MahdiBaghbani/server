@@ -135,11 +135,12 @@ class ExternalShare extends SnowflakeAwareEntity implements \JsonSerializable {
 		$newShare->setRemoteId($this->getRemoteId());
 		$newShare->setShareToken($this->getShareToken());
 		$newShare->setPassword($this->getPassword());
+		$newShare->setAccessToken($this->getAccessToken());
+		$newShare->setAccessTokenExpires($this->getAccessTokenExpires());
 		$newShare->setName($this->getName());
 		$newShare->setOwner($this->getOwner());
 		$newShare->setMountpoint($this->getMountpoint());
 		$newShare->setAccepted($this->getAccepted());
-		$newShare->setPassword($this->getPassword());
 		return $newShare;
 	}
 }

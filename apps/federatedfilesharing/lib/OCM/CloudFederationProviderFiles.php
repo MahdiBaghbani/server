@@ -119,22 +119,27 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 		// Check for must-exchange-token requirement
 		$requirements = $protocol['webdav']['requirements'] ?? $protocol['options']['requirements'] ?? [];
 		$mustExchangeToken = in_array('must-exchange-token', $requirements);
-		$accessToken = '';
+		$accessToken = null;
+		$accessTokenExpires = null;
 
 		if ($mustExchangeToken) {
 			// Exchange the sharedSecret for an access token (required)
-			$accessToken = $this->exchangeToken($remote, $token);
-			if ($accessToken === null) {
+			$tokenExchange = $this->exchangeToken($remote, $token);
+			if ($tokenExchange === null) {
 				throw new ProviderCouldNotAddShareException('Failed to exchange token as required by must-exchange-token', '', Http::STATUS_BAD_REQUEST);
 			}
+			$accessToken = $tokenExchange['accessToken'];
+			$accessTokenExpires = $tokenExchange['expiresAt'];
 		} else {
 			// Check if remote has exchange-token capability and try to exchange (optional)
 			try {
 				$ocmProvider = $this->discoveryService->discover(rtrim($remote, '/'));
 				$capabilities = $ocmProvider->getCapabilities();
 				if (in_array('exchange-token', $capabilities)) {
-					$accessToken = $this->exchangeToken($remote, $token) ?? '';
-					$this->logger->debug('Exchanged token for remote with exchange-token capability', ['remote' => $remote, 'success' => !empty($accessToken)]);
+					$tokenExchange = $this->exchangeToken($remote, $token);
+					$accessToken = $tokenExchange['accessToken'] ?? null;
+					$accessTokenExpires = $tokenExchange['expiresAt'] ?? null;
+					$this->logger->debug('Exchanged token for remote with exchange-token capability', ['remote' => $remote, 'success' => $accessToken !== null]);
 				}
 			} catch (\Exception $e) {
 				$this->logger->debug('Could not discover remote capabilities for token exchange', ['remote' => $remote, 'exception' => $e]);
@@ -181,8 +186,13 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 			$externalShare->generateId();
 			$externalShare->setRemote($remote);
 			$externalShare->setRemoteId($remoteId);
-			$externalShare->setShareToken($token);  // refresh token (sharedSecret)
-			$externalShare->setPassword($accessToken);  // access token (empty if no token exchange)
+			$externalShare->setShareToken($token);
+			if ($accessToken !== null) {
+				$externalShare->setAccessToken($accessToken);
+			}
+			if ($accessTokenExpires !== null) {
+				$externalShare->setAccessTokenExpires($accessTokenExpires);
+			}
 			$externalShare->setName($name);
 			$externalShare->setOwner($owner);
 			$externalShare->setShareType($shareType);
@@ -721,13 +731,11 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 	}
 
 	/**
-	 * Exchange a sharedSecret (refresh token) for an access token via the remote server's token endpoint
+	 * Exchange a sharedSecret (refresh token) for an access token via the remote server's token endpoint.
 	 *
-	 * @param string $remote The remote server URL
-	 * @param string $sharedSecret The shared secret to exchange
-	 * @return string|null The access token, or null on failure
+	 * @return array{accessToken: string, expiresAt: ?int}|null
 	 */
-	private function exchangeToken(string $remote, #[SensitiveParameter] string $sharedSecret): ?string {
+	private function exchangeToken(string $remote, #[SensitiveParameter] string $sharedSecret): ?array {
 		try {
 			$ocmProvider = $this->discoveryService->discover(rtrim($remote, '/'));
 			$tokenEndpoint = $ocmProvider->getTokenEndPoint();
@@ -792,6 +800,7 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 
 			$accessToken = $data['access_token'] ?? null;
 			$tokenType = $data['token_type'] ?? null;
+			$expiresIn = $data['expires_in'] ?? null;
 
 			if (!is_string($accessToken) || $accessToken === '') {
 				$this->logger->warning('Token exchange response missing or invalid access_token', ['remote' => $remote]);
@@ -806,8 +815,19 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 				return null;
 			}
 
-			$this->logger->debug('Successfully exchanged token for access token', ['remote' => $remote]);
-			return $accessToken;
+			$expiresAt = null;
+			if (is_numeric($expiresIn) && (int)$expiresIn > 0) {
+				$expiresAt = time() + (int)$expiresIn;
+			}
+
+			$this->logger->debug('Successfully exchanged token for access token', [
+				'remote' => $remote,
+				'has_expiry' => $expiresAt !== null,
+			]);
+			return [
+				'accessToken' => $accessToken,
+				'expiresAt' => $expiresAt,
+			];
 		} catch (\Exception $e) {
 			$this->logger->warning('Failed to exchange token', ['remote' => $remote, 'exception' => $e]);
 			return null;

@@ -12,6 +12,7 @@ use OC\OCM\OCMSignatoryManager;
 use OCA\FederatedFileSharing\AddressHandler;
 use OCA\FederatedFileSharing\FederatedShareProvider;
 use OCA\FederatedFileSharing\OCM\CloudFederationProviderFiles;
+use OCA\Files_Sharing\External\ExternalShare;
 use OCA\Files_Sharing\External\ExternalShareMapper;
 use OCA\Files_Sharing\External\Manager;
 use OCP\Activity\IManager as IActivityManager;
@@ -29,6 +30,7 @@ use OCP\IAppConfig;
 use OCP\IConfig;
 use OCP\IGroupManager;
 use OCP\IURLGenerator;
+use OCP\IUser;
 use OCP\IUserManager;
 use OCP\Notification\IManager as INotificationManager;
 use OCP\OCM\IOCMDiscoveryService;
@@ -149,6 +151,32 @@ class CloudFederationProviderFilesTest extends TestCase {
 		return $share;
 	}
 
+	private function expectIncomingShareStoresAccessToken(string $expectedToken): void {
+		$user = $this->createMock(IUser::class);
+		$now = time();
+
+		$this->userManager->method('get')->with('localuser')->willReturn($user);
+		$this->filenameValidator->method('isFilenameValid')->willReturn(true);
+		$this->externalShareManager->expects($this->once())
+			->method('addShare')
+			->with(
+				$this->callback(function (ExternalShare $externalShare) use ($expectedToken, $now) {
+					$expiresAt = $externalShare->getAccessTokenExpires();
+
+					return $externalShare->getAccessToken() === $expectedToken
+						&& $externalShare->getPassword() === null
+						&& is_int($expiresAt)
+						&& $expiresAt >= $now + 3590
+						&& $expiresAt <= $now + 3605;
+				}),
+				$user,
+			)
+			->willThrowException(new \RuntimeException('stop after access token assertion'));
+
+		$this->expectException(ProviderCouldNotAddShareException::class);
+		$this->expectExceptionMessage('internal server error, was not able to add share from https://example.com/');
+	}
+
 	/**
 	 * When must-exchange-token is required but the remote has no token endpoint,
 	 * shareReceived must throw rather than silently accept the share.
@@ -211,19 +239,14 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$response->method('getBody')->willReturn(json_encode([
 			'access_token' => 'access-token-xyz',
 			'token_type' => 'Bearer',
+			'expires_in' => 3600,
 		]));
 
 		$httpClient = $this->createMock(\OCP\Http\Client\IClient::class);
 		$httpClient->method('post')->willReturn($response);
 		$this->clientService->method('newClient')->willReturn($httpClient);
 
-		// Exchange succeeds → share creation continues; we stop it at the user
-		// lookup stage to avoid a full integration setup.
-		$this->userManager->method('get')->with('localuser')->willReturn(null);
-		$this->filenameValidator->method('isFilenameValid')->willReturn(true);
-
-		$this->expectException(ProviderCouldNotAddShareException::class);
-		$this->expectExceptionMessage('User does not exists');
+		$this->expectIncomingShareStoresAccessToken('access-token-xyz');
 
 		$this->provider->shareReceived($share);
 	}
@@ -293,17 +316,14 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$response->method('getBody')->willReturn(json_encode([
 			'access_token' => 'access-token-xyz',
 			'token_type' => 'Bearer',
+			'expires_in' => 3600,
 		]));
 
 		$httpClient = $this->createMock(\OCP\Http\Client\IClient::class);
 		$httpClient->method('post')->willReturn($response);
 		$this->clientService->method('newClient')->willReturn($httpClient);
 
-		$this->userManager->method('get')->with('localuser')->willReturn(null);
-		$this->filenameValidator->method('isFilenameValid')->willReturn(true);
-
-		$this->expectException(ProviderCouldNotAddShareException::class);
-		$this->expectExceptionMessage('User does not exists');
+		$this->expectIncomingShareStoresAccessToken('access-token-xyz');
 
 		$this->provider->shareReceived($share);
 	}

@@ -553,6 +553,29 @@ class ManagerTest extends TestCase {
 		$this->verifyDeclinedGroupShare($shareData);
 	}
 
+	public function testAcceptedMountLoadsStoredAccessToken(): void {
+		$this->createTestUserShare($this->user->getUID());
+
+		$openShares = $this->manager->getOpenShares();
+		$this->assertCount(1, $openShares);
+
+		$share = $openShares[0];
+		$share->setAccepted(IShare::STATUS_ACCEPTED);
+		$share->setMountpoint('/SharedFolder');
+		$share->setAccessToken('stored-access-token');
+		$share->setAccessTokenExpires(time() + 3600);
+		$this->externalShareMapper->update($share);
+
+		$this->setupMounts();
+
+		$mount = $this->mountManager->find($this->getFullPath('/SharedFolder'));
+		$this->assertInstanceOf('\OCA\Files_Sharing\External\Mount', $mount);
+
+		$storage = $mount->getStorage();
+		$this->assertInstanceOf('\OCA\Files_Sharing\External\Storage', $storage);
+		$this->assertSame('stored-access-token', $storage->getPassword());
+	}
+
 	public function testDeclineGroupShareAgainThroughGroupShare(): void {
 		[$shareData, $groupShare] = $this->createTestGroupShare();
 		$this->assertTrue($this->manager->acceptShare($groupShare));
