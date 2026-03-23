@@ -55,10 +55,10 @@ class ExternalStorageTest extends \Test\TestCase {
 		];
 	}
 
-	private function getTestStorage($uri) {
+	private function getTestStorage($uri, ?ExternalShareManager $manager = null) {
 		$certificateManager = Server::get(ICertificateManager::class);
 		$httpClientService = $this->createMock(IClientService::class);
-		$manager = $this->createMock(ExternalShareManager::class);
+		$manager ??= $this->createMock(ExternalShareManager::class);
 		$client = $this->createMock(IClient::class);
 		$response = $this->createMock(IResponse::class);
 		$client
@@ -100,12 +100,69 @@ class ExternalStorageTest extends \Test\TestCase {
 		$result = $storage->test();
 		$this->assertSame(true, $result);
 	}
+
+	public function testRefreshBearerTokenUsesServerExpiry(): void {
+		$now = time();
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->expects($this->once())
+			->method('getShareByToken')
+			->with('abcdef')
+			->willReturn(false);
+		$manager->expects($this->once())
+			->method('updateAccessToken')
+			->with(
+				'abcdef',
+				'fresh-access-token',
+				$this->callback(static fn (int $expiresAt): bool => $expiresAt >= $now + 86390 && $expiresAt <= $now + 86410)
+			);
+
+		$storage = $this->getTestStorage('https://remoteserver', $manager);
+		$storage->setExchangeRefreshTokenResponse([
+			'accessToken' => 'fresh-access-token',
+			'expiresIn' => 86400,
+		]);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('fresh-access-token', $storage->getBearerPassword());
+		$this->assertGreaterThanOrEqual($now + 86390, $storage->getTokenExpiry());
+	}
+
+	public function testRefreshBearerTokenFallsBackWhenExpiryMissing(): void {
+		$now = time();
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->expects($this->once())
+			->method('getShareByToken')
+			->with('abcdef')
+			->willReturn(false);
+		$manager->expects($this->once())
+			->method('updateAccessToken')
+			->with(
+				'abcdef',
+				'fresh-access-token',
+				$this->callback(static fn (int $expiresAt): bool => $expiresAt >= $now + 3590 && $expiresAt <= $now + 3610)
+			);
+
+		$storage = $this->getTestStorage('https://remoteserver', $manager);
+		$storage->setExchangeRefreshTokenResponse([
+			'accessToken' => 'fresh-access-token',
+			'expiresIn' => null,
+		]);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertGreaterThanOrEqual($now + 3590, $storage->getTokenExpiry());
+	}
 }
 
 /**
  * Dummy subclass to make it possible to access private members
  */
 class TestSharingExternalStorage extends Storage {
+	/** @var array{accessToken: string, expiresIn: ?int} */
+	private array $exchangeResponse = [
+		'accessToken' => 'fresh-access-token',
+		'expiresIn' => null,
+	];
+
 	public function getBaseUri() {
 		return $this->createBaseUri();
 	}
@@ -115,5 +172,25 @@ class TestSharingExternalStorage extends Storage {
 			return ['key' => 'value'];
 		}
 		return parent::stat($path);
+	}
+
+	public function setExchangeRefreshTokenResponse(array $response): void {
+		$this->exchangeResponse = $response;
+	}
+
+	public function runRefreshBearerToken(): bool {
+		return $this->refreshBearerToken();
+	}
+
+	public function getBearerPassword(): string {
+		return $this->password;
+	}
+
+	public function getTokenExpiry(): int {
+		return \Closure::bind(fn (): int => $this->tokenExpiresAt, $this, Storage::class)();
+	}
+
+	protected function exchangeRefreshTokenResponse(): array {
+		return $this->exchangeResponse;
 	}
 }

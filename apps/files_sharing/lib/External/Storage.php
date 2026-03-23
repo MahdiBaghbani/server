@@ -183,8 +183,11 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 
 		// No valid token in DB — perform the exchange ourselves.
 		try {
-			$expiresAt = $now + 3600; // access tokens are valid for 1 hour
-			$newAccessToken = $this->exchangeRefreshToken();
+			$tokenResponse = $this->exchangeRefreshTokenResponse();
+			$expiresIn = $tokenResponse['expiresIn'] ?? null;
+			// Fall back to the legacy 1-hour window only when the remote omits expiry metadata.
+			$expiresAt = $now + (($expiresIn !== null && $expiresIn > 0) ? $expiresIn : 3600);
+			$newAccessToken = $tokenResponse['accessToken'];
 			$this->password = $newAccessToken;
 			$this->tokenExpiresAt = $expiresAt;
 			$this->refreshFailureCount = 0;

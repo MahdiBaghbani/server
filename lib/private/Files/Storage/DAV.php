@@ -263,6 +263,16 @@ class DAV extends Common {
 	 * @throws StorageNotAvailableException If token exchange fails
 	 */
 	protected function exchangeRefreshToken(): string {
+		return $this->exchangeRefreshTokenResponse()['accessToken'];
+	}
+
+	/**
+	 * Exchange refresh token for access token and keep response metadata.
+	 *
+	 * @return array{accessToken: string, expiresIn: ?int}
+	 * @throws StorageNotAvailableException If token exchange fails
+	 */
+	protected function exchangeRefreshTokenResponse(): array {
 		try {
 			$host = 'https://' . $this->host;
 			$ocmProvider = $this->discoveryService->discover($host);
@@ -327,6 +337,7 @@ class DAV extends Common {
 
 			$accessToken = $data['access_token'] ?? null;
 			$tokenType = $data['token_type'] ?? null;
+			$expiresIn = $data['expires_in'] ?? null;
 
 			if (!is_string($accessToken) || $accessToken === '') {
 				$this->logger->error('Token exchange response missing or invalid access_token', ['app' => 'dav']);
@@ -341,8 +352,17 @@ class DAV extends Common {
 				throw new StorageNotAvailableException('Could not obtain access token: unexpected token_type');
 			}
 
+			if (is_string($expiresIn) && ctype_digit($expiresIn)) {
+				$expiresIn = (int)$expiresIn;
+			}
+			if (!is_int($expiresIn) || $expiresIn <= 0) {
+				$expiresIn = null;
+			}
 			$this->logger->debug('Successfully exchanged refresh token for access token', ['app' => 'dav']);
-			return $accessToken;
+			return [
+				'accessToken' => $accessToken,
+				'expiresIn' => $expiresIn,
+			];
 		} catch (OCMProviderException|OCMArgumentException $e) {
 			$this->logger->error('OCM provider response missing tokenEndPoint', ['app' => 'dav']);
 			throw new StorageNotAvailableException('Could not discover token endpoint');
