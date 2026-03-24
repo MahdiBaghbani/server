@@ -350,18 +350,22 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	 */
 	protected function testRemote(): bool {
 		try {
-			return $this->testRemoteUrl($this->getRemote() . '/ocm-provider/index.php')
-				   || $this->testRemoteUrl($this->getRemote() . '/ocm-provider/')
-				   || $this->testRemoteUrl($this->getRemote() . '/.well-known/ocm')
-				   || $this->testRemoteUrl($this->getRemote() . '/status.php');
+			// OCM discovery and ownCloud/Nextcloud status probing answer different
+			// questions, so validate them separately instead of treating any JSON
+			// payload with a version field as a generic "remote is good" signal.
+			return $this->testOCMRemoteUrl($this->getRemote() . '/ocm-provider/index.php')
+				   || $this->testOCMRemoteUrl($this->getRemote() . '/ocm-provider/')
+				   || $this->testOCMRemoteUrl($this->getRemote() . '/.well-known/ocm')
+				   || $this->testOwnCloudStatusUrl($this->getRemote() . '/status.php');
 		} catch (\Exception $e) {
 			return false;
 		}
 	}
 
-	private function testRemoteUrl(string $url): bool {
+	private function testRemoteUrl(string $url, string $cacheKeyPrefix, \Closure $validator): bool {
 		$cache = $this->memcacheFactory->createDistributed('files_sharing_remote_url');
-		$cached = $cache->get($url);
+		$cacheKey = $cacheKeyPrefix . ':' . $url;
+		$cached = $cache->get($cacheKey);
 		if ($cached !== null) {
 			return (bool)$cached;
 		}
@@ -370,14 +374,52 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 		try {
 			$result = $client->get($url, $this->getDefaultRequestOptions())->getBody();
 			$data = json_decode($result);
-			$returnValue = (is_object($data) && !empty($data->version));
+			$returnValue = $validator($data);
 		} catch (ConnectException|ClientException|RequestException $e) {
 			$returnValue = false;
 			$this->logger->warning('Failed to test remote URL', ['exception' => $e]);
 		}
 
-		$cache->set($url, $returnValue, 60 * 60 * 24);
+		$cache->set($cacheKey, $returnValue, 60 * 60 * 24);
 		return $returnValue;
+	}
+
+	private function testOCMRemoteUrl(string $url): bool {
+		return $this->testRemoteUrl(
+			$url,
+			'ocm',
+			static function (mixed $data): bool {
+				// Minimal OCM discovery shape: enabled flag, endpoint, and resource list.
+				return is_object($data)
+					&& isset($data->enabled)
+					&& !empty($data->endPoint)
+					&& is_array($data->resourceTypes ?? null);
+			}
+		);
+	}
+
+	private function testOwnCloudStatusUrl(string $url): bool {
+		return $this->testRemoteUrl(
+			$url,
+			'status',
+			static function (mixed $data): bool {
+				if (!is_object($data) || empty($data->version)) {
+					return false;
+				}
+
+				// shareinfo is a Nextcloud/ownCloud-specific branch. Reva exposes
+				// status.php too, but should stay on the OCM path instead of being
+				// treated as a shareinfo-capable ownCloud remote.
+				$product = strtolower((string)($data->productname ?? $data->product ?? ''));
+				if ($product === '') {
+					// Keep backward compatibility with older ownCloud-style payloads
+					// that only expose a version field.
+					return true;
+				}
+
+				return in_array($product, ['nextcloud', 'owncloud'], true);
+			}
+		);
 	}
 
 	/**
@@ -387,7 +429,7 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	 * @throws LocalServerException
 	 */
 	public function remoteIsOwnCloud(): bool {
-		if (defined('PHPUNIT_RUN') || !$this->testRemoteUrl($this->getRemote() . '/status.php')) {
+		if (defined('PHPUNIT_RUN') || !$this->testOwnCloudStatusUrl($this->getRemote() . '/status.php')) {
 			return false;
 		}
 		return true;

@@ -60,15 +60,82 @@ class ExternalStorageTest extends \Test\TestCase {
 		$httpClientService = $this->createMock(IClientService::class);
 		$manager ??= $this->createMock(ExternalShareManager::class);
 		$client = $this->createMock(IClient::class);
-		$response = $this->createMock(IResponse::class);
 		$client
 			->expects($this->any())
 			->method('get')
-			->willReturn($response);
+			->willReturnCallback(function (...$_args): IResponse {
+				$response = $this->createMock(IResponse::class);
+				$response
+					->method('getBody')
+					->willReturn(json_encode([
+						'enabled' => true,
+						'endPoint' => 'https://remoteserver/ocm',
+						'resourceTypes' => [],
+					]));
+				return $response;
+			});
 		$client
 			->expects($this->any())
 			->method('post')
-			->willReturn($response);
+			->willReturnCallback(function (...$_args): IResponse {
+				$response = $this->createMock(IResponse::class);
+				$response
+					->method('getBody')
+					->willReturn('{}');
+				return $response;
+			});
+		$httpClientService
+			->expects($this->any())
+			->method('newClient')
+			->willReturn($client);
+
+		return new TestSharingExternalStorage(
+			[
+				'cloudId' => new CloudId('testOwner@' . $uri, 'testOwner', $uri),
+				'remote' => $uri,
+				'owner' => 'testOwner',
+				'mountpoint' => 'remoteshare',
+				'token' => 'abcdef',
+				'password' => '',
+				'manager' => $manager,
+				'certificateManager' => $certificateManager,
+				'HttpClientService' => $httpClientService,
+			]
+		);
+	}
+
+	private function getTestStorageWithGetBodies(string $uri, array $bodies): TestSharingExternalStorage {
+		$certificateManager = Server::get(ICertificateManager::class);
+		$httpClientService = $this->createMock(IClientService::class);
+		$manager = $this->createMock(ExternalShareManager::class);
+		$client = $this->createMock(IClient::class);
+		$defaultOcmDiscoveryBody = json_encode([
+			'enabled' => true,
+			'endPoint' => rtrim($uri, '/') . '/ocm',
+			'resourceTypes' => [],
+		]);
+
+		$client
+			->expects($this->any())
+			->method('get')
+			->willReturnCallback(function (string $url, ...$_args) use ($bodies, $defaultOcmDiscoveryBody): IResponse {
+				$body = $bodies[$url] ?? $defaultOcmDiscoveryBody;
+				$response = $this->createMock(IResponse::class);
+				$response
+					->method('getBody')
+					->willReturn($body);
+				return $response;
+			});
+		$client
+			->expects($this->any())
+			->method('post')
+			->willReturnCallback(function (...$_args): IResponse {
+				$response = $this->createMock(IResponse::class);
+				$response
+					->method('getBody')
+					->willReturn('{}');
+				return $response;
+			});
 		$httpClientService
 			->expects($this->any())
 			->method('newClient')
@@ -151,6 +218,48 @@ class ExternalStorageTest extends \Test\TestCase {
 		$this->assertTrue($storage->runRefreshBearerToken());
 		$this->assertGreaterThanOrEqual($now + 3590, $storage->getTokenExpiry());
 	}
+
+	public function testOwnCloudStatusDetectionRejectsRevaProduct(): void {
+		$remote = 'https://remoteserver';
+		$storage = $this->getTestStorageWithGetBodies($remote, [
+			$remote . '/status.php' => json_encode([
+				'version' => '10.0.11',
+				'productname' => 'reva',
+			]),
+		]);
+
+		$this->assertFalse($storage->runOwnCloudStatusCheck());
+	}
+
+	public function testOwnCloudStatusDetectionAcceptsNextcloudProduct(): void {
+		$remote = 'https://remoteserver';
+		$storage = $this->getTestStorageWithGetBodies($remote, [
+			$remote . '/status.php' => json_encode([
+				'version' => '33.0.0',
+				'productname' => 'Nextcloud',
+			]),
+		]);
+
+		$this->assertTrue($storage->runOwnCloudStatusCheck());
+	}
+
+	public function testRemoteCheckAcceptsOcmDiscoveryWithoutStatusVersion(): void {
+		$remote = 'https://remoteserver';
+		$storage = $this->getTestStorageWithGetBodies($remote, [
+			$remote . '/.well-known/ocm' => json_encode([
+				'enabled' => true,
+				'endPoint' => $remote . '/ocm',
+				'resourceTypes' => [['name' => 'file', 'shareTypes' => ['user'], 'protocols' => ['webdav' => '/remote.php/dav/ocm/']]],
+				'capabilities' => ['shares'],
+			]),
+			$remote . '/status.php' => json_encode([
+				'version' => '10.0.11',
+				'productname' => 'reva',
+			]),
+		]);
+
+		$this->assertTrue($storage->runRemoteCheck());
+	}
 }
 
 /**
@@ -188,6 +297,18 @@ class TestSharingExternalStorage extends Storage {
 
 	public function getTokenExpiry(): int {
 		return \Closure::bind(fn (): int => $this->tokenExpiresAt, $this, Storage::class)();
+	}
+
+	public function runOwnCloudStatusCheck(): bool {
+		return \Closure::bind(
+			fn (): bool => $this->testOwnCloudStatusUrl($this->getRemote() . '/status.php'),
+			$this,
+			Storage::class
+		)();
+	}
+
+	public function runRemoteCheck(): bool {
+		return \Closure::bind(fn (): bool => $this->testRemote(), $this, Storage::class)();
 	}
 
 	protected function exchangeRefreshTokenResponse(): array {
