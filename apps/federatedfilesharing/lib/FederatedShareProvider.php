@@ -215,7 +215,9 @@ class FederatedShareProvider implements IShareProvider, IShareProviderSupportsAl
 				$ownerCloudId->getId(),
 				$share->getSharedBy(),
 				$sharedByFederatedId,
-				$share->getShareType()
+				$share->getShareType(),
+				// Keep the outbound OCM permission list in sync with the stored share.
+				$share->getPermissions()
 			);
 
 			if ($send === false) {

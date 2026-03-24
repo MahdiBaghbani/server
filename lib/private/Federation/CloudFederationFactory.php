@@ -35,13 +35,16 @@ class CloudFederationFactory implements ICloudFederationFactory {
 	 * @param string $sharedSecret used to authenticate requests across servers
 	 * @param string $shareType ('group' or 'user' share)
 	 * @param $resourceType ('file', 'calendar',...)
+	 * @param int|null $permissions share permission bitmask for outgoing shares
 	 * @return ICloudFederationShare
 	 *
 	 * @since 14.0.0
 	 */
-	public function getCloudFederationShare($shareWith, $name, $description, $providerId, $owner, $ownerDisplayName, $sharedBy, $sharedByDisplayName, $sharedSecret, $shareType, $resourceType) {
+	public function getCloudFederationShare($shareWith, $name, $description, $providerId, $owner, $ownerDisplayName, $sharedBy, $sharedByDisplayName, $sharedSecret, $shareType, $resourceType, $permissions = null) {
 		$useExchangeToken = false;
 		$remoteDomain = null;
+		// Exchange-token shares must point back to the sender's own DAV root.
+		$senderWebdavUri = $this->getLocalProtocolEndpoint('file', 'webdav');
 
 		try {
 			$cloudId = $this->cloudIdManager->resolveCloudId($shareWith);
@@ -52,6 +55,14 @@ class CloudFederationFactory implements ICloudFederationFactory {
 				$capabilities = $remoteProvider->getCapabilities();
 
 				$useExchangeToken = in_array('exchange-token', $capabilities, true);
+				// Without a sender-owned DAV endpoint we would emit a broken OCM 1.1 payload,
+				// so keep using the legacy path instead.
+				if ($useExchangeToken && $senderWebdavUri === null) {
+					$useExchangeToken = false;
+					$this->logger->warning('Missing local webdav endpoint, falling back to legacy share method', [
+						'remote' => $remoteDomain,
+					]);
+				}
 
 				$this->logger->debug('OCM provider capabilities discovered', [
 					'remote' => $remoteDomain,
@@ -84,7 +95,9 @@ class CloudFederationFactory implements ICloudFederationFactory {
 			$resourceType,
 			$sharedSecret,
 			$useExchangeToken,
-			$remoteDomain
+			$remoteDomain,
+			$permissions,
+			$senderWebdavUri
 		);
 	}
 
@@ -98,5 +111,50 @@ class CloudFederationFactory implements ICloudFederationFactory {
 	 */
 	public function getCloudFederationNotification() {
 		return new CloudFederationNotification();
+	}
+
+	/**
+	 * Resolve a locally advertised OCM protocol path into the absolute URL that
+	 * remote receivers should use.
+	 */
+	private function getLocalProtocolEndpoint(string $resourceType, string $protocolName): ?string {
+		$provider = $this->ocmDiscoveryService->getLocalOCMProvider(false);
+		foreach ($provider->getResourceTypes() as $resource) {
+			if ($resource->getName() !== $resourceType) {
+				continue;
+			}
+
+			$protocols = $resource->getProtocols();
+			$protocolPath = $protocols[$protocolName] ?? null;
+			if (!is_string($protocolPath) || $protocolPath === '') {
+				continue;
+			}
+
+			return $this->buildAbsoluteProtocolUrl($provider->getEndPoint(), $protocolPath);
+		}
+
+		return null;
+	}
+
+	/**
+	 * Local discovery currently exposes protocol roots as relative paths, so fold
+	 * them onto the discovered endpoint origin before sending them out.
+	 */
+	private function buildAbsoluteProtocolUrl(string $endpoint, string $protocolPath): string {
+		if (preg_match('/^https?:\/\//i', $protocolPath) === 1) {
+			return $protocolPath;
+		}
+
+		$parts = parse_url($endpoint);
+		if (!is_array($parts) || !isset($parts['scheme'], $parts['host'])) {
+			return $protocolPath;
+		}
+
+		$origin = $parts['scheme'] . '://' . $parts['host'];
+		if (isset($parts['port'])) {
+			$origin .= ':' . $parts['port'];
+		}
+
+		return rtrim($origin, '/') . '/' . ltrim($protocolPath, '/');
 	}
 }

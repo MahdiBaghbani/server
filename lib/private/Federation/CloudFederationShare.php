@@ -6,6 +6,7 @@
  */
 namespace OC\Federation;
 
+use OCP\Constants;
 use OCP\Federation\ICloudFederationShare;
 use OCP\Share\IShare;
 
@@ -41,7 +42,9 @@ class CloudFederationShare implements ICloudFederationShare {
 	 * @param string $resourceType ('file', 'calendar',...)
 	 * @param string $sharedSecret
 	 * @param bool $useExchangeToken whether to use exchange-token protocol (new way) or sharedSecret (old way)
-	 * @param string|null $remoteDomain remote domain for constructing webdav URI
+	 * @param string|null $remoteDomain remote domain discovered for the share
+	 * @param int|null $permissions share permission bitmask
+	 * @param string|null $senderWebdavUri sender-owned webdav endpoint
 	 */
 	public function __construct($shareWith = '',
 		$name = '',
@@ -56,6 +59,8 @@ class CloudFederationShare implements ICloudFederationShare {
 		$sharedSecret = '',
 		$useExchangeToken = false,
 		$remoteDomain = null,
+		$permissions = null,
+		$senderWebdavUri = null,
 	) {
 		$this->setShareWith($shareWith);
 		$this->setResourceName($name);
@@ -67,13 +72,14 @@ class CloudFederationShare implements ICloudFederationShare {
 		$this->setSharedByDisplayName($sharedByDisplayName);
 
 		if ($useExchangeToken) {
-			$webdavUri = $remoteDomain ? 'https://' . $remoteDomain . '/public.php/webdav/' : '';
+			// OCM 1.1+ expects a concrete sender endpoint and explicit OCM permission
+			// strings, not the DAV property token used by the legacy path.
 			$this->setProtocol([
 				'name' => 'webdav',
 				'webdav' => [
-					'uri' => $webdavUri,
+					'uri' => $senderWebdavUri ?? '',
 					'sharedSecret' => $sharedSecret,
-					'permissions' => ['{http://open-cloud-mesh.org/ns}share-permissions']
+					'permissions' => $this->ncPermissions2ocmPermissions($permissions),
 				]
 			]);
 		} else {
@@ -370,5 +376,32 @@ class CloudFederationShare implements ICloudFederationShare {
 	 */
 	public function getProtocol() {
 		return $this->share['protocol'];
+	}
+
+	/**
+	 * Translate the internal Nextcloud permission bitmask to the OCM permission
+	 * vocabulary used in outbound JSON payloads.
+	 *
+	 * @param int|null $ncPermissions
+	 * @return list<string>
+	 */
+	private function ncPermissions2ocmPermissions($ncPermissions): array {
+		$ocmPermissions = [];
+
+		if ($ncPermissions !== null && ($ncPermissions & Constants::PERMISSION_SHARE)) {
+			$ocmPermissions[] = 'share';
+		}
+
+		if ($ncPermissions === null || ($ncPermissions & Constants::PERMISSION_READ)) {
+			$ocmPermissions[] = 'read';
+		}
+
+		if ($ncPermissions !== null
+			&& (($ncPermissions & Constants::PERMISSION_CREATE)
+				|| ($ncPermissions & Constants::PERMISSION_UPDATE))) {
+			$ocmPermissions[] = 'write';
+		}
+
+		return $ocmPermissions;
 	}
 }

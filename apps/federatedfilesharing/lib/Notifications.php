@@ -46,11 +46,12 @@ class Notifications {
 	 * @param string $sharedBy
 	 * @param string $sharedByFederatedId
 	 * @param int $shareType (can be a remote user or group share)
+	 * @param int|null $permissions share permission bitmask passed to the OCM payload builder
 	 * @return bool
 	 * @throws HintException
 	 * @throws ServerNotAvailableException
 	 */
-	public function sendRemoteShare($token, $shareWith, $name, $remoteId, $owner, $ownerFederatedId, $sharedBy, $sharedByFederatedId, $shareType) {
+	public function sendRemoteShare($token, $shareWith, $name, $remoteId, $owner, $ownerFederatedId, $sharedBy, $sharedByFederatedId, $shareType, $permissions = null) {
 		[$user, $remote] = $this->addressHandler->splitUserRemote($shareWith);
 
 		if ($user && $remote) {
@@ -66,7 +67,8 @@ class Notifications {
 				'sharedBy' => $sharedBy,
 				'sharedByFederatedId' => $sharedByFederatedId,
 				'remote' => $local,
-				'shareType' => $shareType
+				'shareType' => $shareType,
+				'permissions' => $permissions,
 			];
 
 			$result = $this->tryHttpPostToShareEndpoint($remote, '', $fields);
@@ -373,7 +375,8 @@ class Notifications {
 					$fields['sharedBy'],
 					$fields['token'],
 					$fields['shareType'],
-					'file'
+					'file',
+					$fields['permissions'] ?? null
 				);
 				return $this->federationProviderManager->sendShare($share);
 			case 'reshare':
