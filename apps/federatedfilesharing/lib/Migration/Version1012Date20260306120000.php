@@ -19,7 +19,6 @@ use OCP\IDBConnection;
 use OCP\IUserManager;
 use OCP\Migration\IOutput;
 use OCP\Migration\SimpleMigrationStep;
-use OCP\Security\ISecureRandom;
 use OCP\Server;
 use OCP\Share\IShare;
 
@@ -28,9 +27,10 @@ use OCP\Share\IShare;
  * as permanent tokens, which is required for the OCM token exchange flow.
  *
  * Shares created before this fork used TokenHandler (15-char tokens) and never
- * registered in oc_authtoken. Those tokens are replaced with new 32-char tokens.
- * Note: the remote's copy of a replaced token becomes stale; affected shares will
- * need to be re-created.
+ * registered in oc_authtoken. Those legacy short tokens are left untouched so
+ * that the receiving instance can continue to authenticate via Basic auth with
+ * the original token. They will never participate in the token exchange flow,
+ * but they will keep working until the share is re-created with a new token.
  *
  * Shares created by this fork (32-char tokens) that are somehow missing from
  * oc_authtoken are silently repaired.
@@ -43,7 +43,6 @@ class Version1012Date20260306120000 extends SimpleMigrationStep {
 	public function postSchemaChange(IOutput $output, Closure $schemaClosure, array $options): void {
 		$db = Server::get(IDBConnection::class);
 		$tokenProvider = Server::get(PublicKeyTokenProvider::class);
-		$random = Server::get(ISecureRandom::class);
 		$userManager = Server::get(IUserManager::class);
 
 		$qb = $db->getQueryBuilder();
@@ -58,7 +57,6 @@ class Version1012Date20260306120000 extends SimpleMigrationStep {
 			))
 			->executeQuery();
 
-		$replaced = 0;
 		$registered = 0;
 		$skipped = 0;
 
@@ -68,30 +66,21 @@ class Version1012Date20260306120000 extends SimpleMigrationStep {
 			$uid = (string)$row['uid_initiator'];
 
 			if (strlen($token) < PublicKeyTokenProvider::TOKEN_MIN_LENGTH) {
-				// Old short token from TokenHandler — cannot register in oc_authtoken.
-				// Generate a new 32-char token and update oc_share.
-				$newToken = $random->generate(
-					32,
-					ISecureRandom::CHAR_UPPER . ISecureRandom::CHAR_LOWER . ISecureRandom::CHAR_DIGITS
-				);
+				// Old short token from TokenHandler — leave it as-is.
+				// Replacing it would invalidate the token stored on the receiving instance,
+				// breaking Basic-auth access to those shares. These shares keep working via
+				// Basic auth and are simply not eligible for the OCM token exchange flow.
+				$skipped++;
+				continue;
+			}
 
-				$updateQb = $db->getQueryBuilder();
-				$updateQb->update('share')
-					->set('token', $updateQb->createNamedParameter($newToken))
-					->where($updateQb->expr()->eq('id', $updateQb->createNamedParameter($shareId, IQueryBuilder::PARAM_INT)));
-				$updateQb->executeStatement();
-
-				$token = $newToken;
-				$replaced++;
-			} else {
-				// Long token — check if it's already in oc_authtoken.
-				try {
-					$tokenProvider->getToken($token);
-					$skipped++;
-					continue;
-				} catch (InvalidTokenException) {
-					// Not registered yet — fall through to create it.
-				}
+			// Long token — check if it's already in oc_authtoken.
+			try {
+				$tokenProvider->getToken($token);
+				$skipped++;
+				continue;
+			} catch (InvalidTokenException) {
+				// Not registered yet — fall through to create it.
 			}
 
 			$user = $userManager->get($uid);
@@ -120,18 +109,9 @@ class Version1012Date20260306120000 extends SimpleMigrationStep {
 		$result->closeCursor();
 
 		$output->info(sprintf(
-			'Federated share token migration: %d replaced (short tokens), %d registered, %d already up-to-date.',
-			$replaced,
+			'Federated share token migration: %d registered, %d skipped (already up-to-date or legacy short token).',
 			$registered,
 			$skipped
 		));
-
-		if ($replaced > 0) {
-			$output->warning(sprintf(
-				'%d federated share(s) had their token replaced. The remote side\'s copy of the '
-				. 'old token is now stale — those shares will need to be re-created.',
-				$replaced
-			));
-		}
 	}
 }
