@@ -83,10 +83,6 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$webDavEndpoint = $ocmProvider->extractProtocolEntry('file', 'webdav');
 			$remote = $ocmProvider->getEndPoint();
 			$authType = \Sabre\DAV\Client::AUTH_BASIC;
-			$capabilities = $ocmProvider->getCapabilities();
-			if (in_array('exchange-token', $capabilities)) {
-				$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
-			}
 		} catch (OCMProviderException|OCMArgumentException $e) {
 			$this->logger->notice('exception while retrieving webdav endpoint', ['exception' => $e]);
 			$webDavEndpoint = '/public.php/webdav';
@@ -94,8 +90,9 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$authType = \Sabre\DAV\Client::AUTH_BASIC;
 		}
 
-		// If we have a stored access token, use Bearer auth regardless of discovery.
-		// This handles the case where the share was created with must-exchange-token.
+		// Only use Bearer auth when an access token is already stored.
+		// Shares created before the exchange-token capability was introduced have no
+		// stored token and must keep using basic auth for backwards compatibility.
 		if (!empty($options['access_token'])) {
 			$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
 		}
