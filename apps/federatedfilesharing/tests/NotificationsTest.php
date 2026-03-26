@@ -8,14 +8,24 @@ declare(strict_types=1);
  */
 namespace OCA\FederatedFileSharing\Tests;
 
+use OC\Federation\CloudFederationFactory;
+use OC\Federation\CloudFederationShare;
 use OCA\FederatedFileSharing\AddressHandler;
 use OCA\FederatedFileSharing\BackgroundJob\RetryJob;
+use OCA\FederatedFileSharing\Events\FederatedShareAddedEvent;
 use OCA\FederatedFileSharing\Notifications;
 use OCP\BackgroundJob\IJobList;
+use OCP\Constants;
 use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Federation\ICloudFederationFactory;
 use OCP\Federation\ICloudFederationProviderManager;
+use OCP\Federation\ICloudFederationShare;
+use OCP\Federation\ICloudId;
+use OCP\Federation\ICloudIdManager;
 use OCP\Http\Client\IClientService;
+use OCP\OCM\IOCMDiscoveryService;
+use OCP\OCM\IOCMProvider;
+use OCP\OCM\IOCMResource;
 use OCP\OCS\IDiscoveryService;
 use PHPUnit\Framework\MockObject\MockObject;
 use Psr\Log\LoggerInterface;
@@ -133,5 +143,118 @@ class NotificationsTest extends \Test\TestCase {
 			[0, ['success' => false, 'result' => json_encode(['ocs' => ['meta' => ['statuscode' => 100]]])], false],
 			[0, ['success' => false, 'result' => json_encode(['ocs' => ['meta' => ['statuscode' => 400]]])], false],
 		];
+	}
+
+	public function testSendRemoteShareUsesPermissionsInExchangeTokenPayload(): void {
+		$this->addressHandler->expects(self::once())
+			->method('splitUserRemote')
+			->with('remoteuser@remote.example')
+			->willReturn(['remoteuser', 'remote.example']);
+		$this->addressHandler->expects(self::once())
+			->method('generateRemoteURL')
+			->willReturn('https://local.example/index.php/apps/federation');
+		$this->addressHandler->expects(self::once())
+			->method('urlContainProtocol')
+			->with('remote.example')
+			->willReturn(false);
+
+		$remoteCloudId = $this->createMock(ICloudId::class);
+		$remoteCloudId->method('getRemote')->willReturn('remote.example');
+
+		$cloudIdManager = $this->createMock(ICloudIdManager::class);
+		$cloudIdManager->expects(self::once())
+			->method('resolveCloudId')
+			->with('remoteuser@https://remote.example')
+			->willReturn($remoteCloudId);
+
+		$localResource = $this->createMock(IOCMResource::class);
+		$localResource->method('getName')->willReturn('file');
+		$localResource->method('getProtocols')->willReturn([
+			'webdav' => '/public.php/dav/files/sender',
+		]);
+
+		$localProvider = $this->createMock(IOCMProvider::class);
+		$localProvider->method('getResourceTypes')->willReturn([$localResource]);
+		$localProvider->method('getEndPoint')->willReturn('https://local.example/ocm');
+
+		$remoteProvider = $this->createMock(IOCMProvider::class);
+		$remoteProvider->method('getCapabilities')->willReturn(['exchange-token']);
+
+		$ocmDiscoveryService = $this->createMock(IOCMDiscoveryService::class);
+		$ocmDiscoveryService->expects(self::once())
+			->method('getLocalOCMProvider')
+			->with(false)
+			->willReturn($localProvider);
+		$ocmDiscoveryService->expects(self::once())
+			->method('discover')
+			->with('remote.example')
+			->willReturn($remoteProvider);
+
+		$cloudFederationFactory = new CloudFederationFactory(
+			$ocmDiscoveryService,
+			$cloudIdManager,
+			$this->logger,
+		);
+
+		$instance = new Notifications(
+			$this->addressHandler,
+			$this->httpClientService,
+			$this->discoveryService,
+			$this->jobList,
+			$this->cloudFederationProviderManager,
+			$cloudFederationFactory,
+			$this->eventDispatcher,
+			$this->logger,
+		);
+
+		$permissions = Constants::PERMISSION_READ
+			| Constants::PERMISSION_UPDATE
+			| Constants::PERMISSION_SHARE;
+
+		$this->cloudFederationProviderManager->expects(self::once())
+			->method('sendShare')
+			->with(self::callback(static function (ICloudFederationShare $share): bool {
+				self::assertInstanceOf(CloudFederationShare::class, $share);
+
+				$protocol = $share->getProtocol();
+				self::assertSame('webdav', $protocol['name']);
+				self::assertSame(
+					'https://local.example/public.php/dav/files/sender',
+					$protocol['webdav']['uri']
+				);
+				self::assertSame(
+					['share', 'read', 'write'],
+					$protocol['webdav']['permissions']
+				);
+				self::assertStringNotContainsString(
+					'https://https://',
+					$protocol['webdav']['uri']
+				);
+
+				return true;
+			}))
+			->willReturn([
+				'token' => 'generated-token',
+				'providerId' => 'remote-provider-id',
+			]);
+
+		$this->eventDispatcher->expects(self::once())
+			->method('dispatchTyped')
+			->with(self::callback(static function ($event): bool {
+				return $event instanceof FederatedShareAddedEvent;
+			}));
+
+		$this->assertTrue($instance->sendRemoteShare(
+			'refresh-token-abc',
+			'remoteuser@remote.example',
+			'Shared folder',
+			'remote-provider-id',
+			'Owner',
+			'owner@example.org',
+			'Sender',
+			'sender@example.org',
+			0,
+			$permissions,
+		));
 	}
 }
