@@ -8,12 +8,12 @@
 namespace OCA\CloudFederationAPI\Controller;
 
 use OC\Authentication\Token\PublicKeyTokenProvider;
-use OCA\DAV\Db\OcmTokenMapMapper;
 use OC\OCM\OCMSignatoryManager;
 use OCA\CloudFederationAPI\Config;
 use OCA\CloudFederationAPI\Db\FederatedInviteMapper;
 use OCA\CloudFederationAPI\Events\FederatedInviteAcceptedEvent;
 use OCA\CloudFederationAPI\ResponseDefinitions;
+use OCA\DAV\Db\OcmTokenMapMapper;
 use OCA\FederatedFileSharing\AddressHandler;
 use OCP\AppFramework\Controller;
 use OCP\AppFramework\Db\DoesNotExistException;
