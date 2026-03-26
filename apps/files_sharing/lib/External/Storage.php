@@ -98,7 +98,14 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 		}
 
 		$host = parse_url($remote, PHP_URL_HOST);
+		// If host extraction fails (e.g., endpoint has no scheme), fall back to cloudId's remote
+		if ($host === null) {
+			$host = parse_url($this->cloudId->getRemote(), PHP_URL_HOST);
+		}
 		$port = parse_url($remote, PHP_URL_PORT);
+		if ($port === null) {
+			$port = parse_url($this->cloudId->getRemote(), PHP_URL_PORT);
+		}
 		$host .= ($port === null) ? '' : ':' . $port; // we add port if available
 
 		// in case remote NC is on a sub folder and using deprecated ocm provider
@@ -111,9 +118,12 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 		$this->token = $options['token'];
 		$this->tokenExpiresAt = (int)($options['access_token_expires'] ?? 0);
 
+		// Determine scheme - fall back to cloudId's remote if $remote has no scheme
+		$scheme = parse_url($remote, PHP_URL_SCHEME) ?? parse_url($this->cloudId->getRemote(), PHP_URL_SCHEME) ?? 'https';
+
 		parent::__construct(
 			[
-				'secure' => ((parse_url($remote, PHP_URL_SCHEME) ?? 'https') === 'https'),
+				'secure' => ($scheme === 'https'),
 				'verify' => !$this->config->getSystemValueBool('sharing.federation.allowSelfSignedCertificates', false),
 				'host' => $host,
 				'root' => $webDavEndpoint,
