@@ -576,6 +576,23 @@ class ManagerTest extends TestCase {
 		$this->assertSame('stored-access-token', $storage->getPassword());
 	}
 
+	public function testAcceptGroupShareCopiesStoredAccessTokenExpiryToSubShare(): void {
+		[$shareData, $groupShare] = $this->createTestGroupShare();
+
+		$expiresAt = time() + 3600;
+		$groupShare->setAccessToken('stored-access-token');
+		$groupShare->setAccessTokenExpires($expiresAt);
+		$this->externalShareMapper->update($groupShare);
+
+		$this->assertTrue($this->manager->acceptShare($groupShare));
+		$this->verifyAcceptedGroupShare($shareData);
+
+		$acceptedShares = $this->externalShareMapper->getShares($this->user, IShare::STATUS_ACCEPTED);
+		$this->assertCount(1, $acceptedShares);
+		$this->assertSame('stored-access-token', $acceptedShares[0]->getAccessToken());
+		$this->assertSame($expiresAt, $acceptedShares[0]->getAccessTokenExpires());
+	}
+
 	public function testDeclineGroupShareAgainThroughGroupShare(): void {
 		[$shareData, $groupShare] = $this->createTestGroupShare();
 		$this->assertTrue($this->manager->acceptShare($groupShare));

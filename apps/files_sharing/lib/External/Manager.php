@@ -193,6 +193,7 @@ class Manager {
 				$subShare->setRemote($externalShare->getRemote());
 				$subShare->setPassword($externalShare->getPassword());
 				$subShare->setAccessToken($externalShare->getAccessToken());
+				$subShare->setAccessTokenExpires($externalShare->getAccessTokenExpires());
 				$subShare->setName($externalShare->getName());
 				$subShare->setOwner($externalShare->getOwner());
 				$subShare->setUser($user->getUID());

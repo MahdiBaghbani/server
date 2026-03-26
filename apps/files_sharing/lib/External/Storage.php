@@ -100,9 +100,17 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
 		}
 
-		$host = parse_url($remote, PHP_URL_HOST);
-		$port = parse_url($remote, PHP_URL_PORT);
-		$host .= ($port === null) ? '' : ':' . $port; // we add port if available
+		$host = parse_url($remote, PHP_URL_HOST)
+			?? parse_url($this->cloudId->getRemote(), PHP_URL_HOST)
+			?? $this->cloudId->getRemote();
+		$port = parse_url($remote, PHP_URL_PORT)
+			?? parse_url($this->cloudId->getRemote(), PHP_URL_PORT);
+		if ($port !== null) {
+			$host .= ':' . $port;
+		}
+		$scheme = parse_url($remote, PHP_URL_SCHEME)
+			?? parse_url($this->cloudId->getRemote(), PHP_URL_SCHEME)
+			?? 'https';
 
 		// in case remote NC is on a sub folder and using deprecated ocm provider
 		$tmpPath = rtrim(parse_url($this->cloudId->getRemote(), PHP_URL_PATH) ?? '', '/');
@@ -116,7 +124,7 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 
 		parent::__construct(
 			[
-				'secure' => ((parse_url($remote, PHP_URL_SCHEME) ?? 'https') === 'https'),
+				'secure' => ($scheme === 'https'),
 				'verify' => !$this->config->getSystemValueBool('sharing.federation.allowSelfSignedCertificates', false),
 				'host' => $host,
 				'root' => $webDavEndpoint,
