@@ -9,18 +9,26 @@ declare(strict_types=1);
 
 namespace OCA\CloudFederationApi\Tests;
 
+use OC\Authentication\Token\PublicKeyTokenProvider;
 use OCA\CloudFederationAPI\Config;
 use OCA\CloudFederationAPI\Controller\RequestHandlerController;
 use OCA\CloudFederationAPI\Db\FederatedInvite;
 use OCA\CloudFederationAPI\Db\FederatedInviteMapper;
+use OCA\DAV\Db\OcmTokenMap;
+use OCA\DAV\Db\OcmTokenMapMapper;
 use OCA\FederatedFileSharing\AddressHandler;
+use OCP\Authentication\Token\IToken;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
 use OCP\AppFramework\Utility\ITimeFactory;
 use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Federation\ICloudFederationFactory;
+use OCP\Federation\ICloudFederationProvider;
 use OCP\Federation\ICloudFederationProviderManager;
+use OCP\Federation\ICloudFederationShare;
+use OCP\Federation\ICloudId;
 use OCP\Federation\ICloudIdManager;
+use OCP\Federation\ISignedCloudFederationProvider;
 use OCP\IAppConfig;
 use OCP\IGroupManager;
 use OCP\IRequest;
@@ -28,6 +36,7 @@ use OCP\IURLGenerator;
 use OCP\IUser;
 use OCP\IUserManager;
 use OCP\OCM\IOCMDiscoveryService;
+use OCP\Security\Signature\Exceptions\SignatoryNotFoundException;
 use OCP\Security\Signature\ISignatureManager;
 use PHPUnit\Framework\MockObject\MockObject;
 use Psr\Log\LoggerInterface;
@@ -53,6 +62,10 @@ class RequestHandlerControllerTest extends TestCase {
 	private ITimeFactory&MockObject $timeFactory;
 
 	private RequestHandlerController $requestHandlerController;
+
+	protected function IsDatabaseAccessAllowed(): bool {
+		return true;
+	}
 
 	protected function setUp(): void {
 		parent::setUp();
@@ -133,5 +146,164 @@ class RequestHandlerControllerTest extends TestCase {
 		$json = new JSONResponse($response, Http::STATUS_OK);
 
 		$this->assertEquals($json, $this->requestHandlerController->inviteAccepted($recipientProvider, $token, $recipientId, $recipientEmail, $recipientName));
+	}
+
+	public function testAddSharePassesFullCloudIdToFactory(): void {
+		$this->appConfig->method('getValueBool')->willReturn(true);
+		$this->config->method('getSupportedShareTypes')->with('file')->willReturn(['user']);
+
+		$cloudId = $this->createMock(ICloudId::class);
+		$cloudId->method('getUser')->willReturn('localuser');
+		$this->cloudIdManager->expects(self::once())
+			->method('resolveCloudId')
+			->with('localuser@remote.example')
+			->willReturn($cloudId);
+
+		$this->userManager->expects(self::once())
+			->method('userExists')
+			->with('localuser')
+			->willReturn(true);
+
+		$user = $this->createMock(IUser::class);
+		$user->method('getDisplayName')->willReturn('Local User');
+		$user->method('getUID')->willReturn('localuser');
+		$this->userManager->expects(self::once())
+			->method('get')
+			->with('localuser')
+			->willReturn($user);
+
+		$share = $this->createMock(ICloudFederationShare::class);
+		$share->expects(self::once())
+			->method('setShareWith')
+			->with('localuser');
+		$share->expects(self::once())
+			->method('setProtocol')
+			->with([
+				'name' => 'webdav',
+				'webdav' => ['sharedSecret' => 'shared-secret'],
+			]);
+
+		$this->cloudFederationFactory->expects(self::once())
+			->method('getCloudFederationShare')
+			->with(
+				'localuser@remote.example',
+				'Shared file',
+				null,
+				'provider-id',
+				'owner@example.org',
+				'Owner',
+				'owner@example.org',
+				'Owner',
+				'',
+				'user',
+				'file',
+			)
+			->willReturn($share);
+
+		$provider = $this->createMock(ICloudFederationProvider::class);
+		$provider->expects(self::once())
+			->method('shareReceived')
+			->with($share);
+		$this->cloudFederationProviderManager->expects(self::once())
+			->method('getCloudFederationProvider')
+			->with('file')
+			->willReturn($provider);
+
+		$response = $this->requestHandlerController->addShare(
+			'localuser@remote.example',
+			'Shared file',
+			null,
+			'provider-id',
+			'owner@example.org',
+			'Owner',
+			null,
+			null,
+			[
+				'name' => 'webdav',
+				'webdav' => ['sharedSecret' => 'shared-secret'],
+			],
+			'user',
+			'file',
+		);
+
+		self::assertSame(Http::STATUS_CREATED, $response->getStatus());
+		self::assertSame([
+			'recipientDisplayName' => 'Local User',
+			'recipientUserId' => 'localuser',
+		], $response->getData());
+	}
+
+	public function testReceiveNotificationFallsBackThroughMappedAccessToken(): void {
+		$this->appConfig->method('getValueBool')->willReturn(false);
+		$this->discoveryService->expects(self::once())
+			->method('getIncomingSignedRequest')
+			->willReturn(null);
+
+		$provider = $this->createMock(ISignedCloudFederationProvider::class);
+		$provider->expects(self::exactly(2))
+			->method('getFederationIdFromSharedSecret')
+			->willReturnCallback(function (string $sharedSecret, array $payload): string {
+				self::assertSame(['sharedSecret' => 'mapped-access-token'], $payload);
+
+				return match ($sharedSecret) {
+					'mapped-access-token' => '',
+					'refresh-token-abc' => 'user@remote.example',
+					default => self::fail('Unexpected shared secret lookup: ' . $sharedSecret),
+				};
+			});
+		$provider->expects(self::once())
+			->method('notificationReceived')
+			->with('SHARE_ACCEPTED', 'provider-id', ['sharedSecret' => 'mapped-access-token'])
+			->willReturn(['result' => 'ok']);
+
+		$this->cloudFederationProviderManager->expects(self::exactly(2))
+			->method('getCloudFederationProvider')
+			->with('file')
+			->willReturn($provider);
+
+		$token = $this->createConfiguredMock(IToken::class, [
+			'getId' => 1234,
+		]);
+		$tokenProvider = $this->createMock(PublicKeyTokenProvider::class);
+		$tokenProvider->expects(self::once())
+			->method('getToken')
+			->with('mapped-access-token')
+			->willReturn($token);
+		$this->overwriteService(PublicKeyTokenProvider::class, $tokenProvider);
+
+		$mapping = new OcmTokenMap();
+		$mapping->setAccessTokenId(1234);
+		$mapping->setRefreshToken('refresh-token-abc');
+		$mapping->setExpires(time() + 300);
+
+		$mapper = $this->createMock(OcmTokenMapMapper::class);
+		$mapper->expects(self::once())
+			->method('getByAccessTokenId')
+			->with(1234)
+			->willReturn($mapping);
+		$this->overwriteService(OcmTokenMapMapper::class, $mapper);
+
+		$this->addressHandler->expects(self::once())
+			->method('removeProtocolFromUrl')
+			->with('remote.example')
+			->willReturn('remote.example');
+		$this->signatureManager->expects(self::once())
+			->method('extractIdentityFromUri')
+			->with('https://remote.example')
+			->willReturn('remote.example');
+		$this->signatureManager->expects(self::once())
+			->method('getSignatory')
+			->with('remote.example')
+			->willThrowException(new SignatoryNotFoundException());
+
+		$response = $this->requestHandlerController->receiveNotification(
+			'SHARE_ACCEPTED',
+			'file',
+			'provider-id',
+			['sharedSecret' => 'mapped-access-token'],
+		);
+
+		self::assertSame(Http::STATUS_CREATED, $response->getStatus());
+		self::assertSame(['result' => 'ok'], $response->getData());
 	}
 }

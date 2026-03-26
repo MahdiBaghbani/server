@@ -151,21 +151,27 @@ class CloudFederationProviderFilesTest extends TestCase {
 		return $share;
 	}
 
-	private function expectIncomingShareStoresAccessToken(string $expectedToken): void {
+	private function expectIncomingShareStoresAccessToken(string $expectedToken, ?callable $assertExpiry = null): void {
 		$user = $this->createMock(IUser::class);
-		$now = time();
 
 		$this->userManager->method('get')->with('localuser')->willReturn($user);
 		$this->filenameValidator->method('isFilenameValid')->willReturn(true);
 		$this->externalShareManager->expects($this->once())
 			->method('addShare')
 			->with(
-				$this->callback(function (ExternalShare $externalShare) use ($expectedToken, $now) {
+				$this->callback(function (ExternalShare $externalShare) use ($expectedToken, $assertExpiry) {
 					$expiresAt = $externalShare->getAccessTokenExpires();
 
-					return $externalShare->getAccessToken() === $expectedToken
-						&& $externalShare->getPassword() === null
-						&& is_int($expiresAt)
+					if ($externalShare->getAccessToken() !== $expectedToken || $externalShare->getPassword() !== null) {
+						return false;
+					}
+
+					if ($assertExpiry !== null) {
+						return $assertExpiry($expiresAt);
+					}
+
+					$now = time();
+					return is_int($expiresAt)
 						&& $expiresAt >= $now + 3590
 						&& $expiresAt <= $now + 3605;
 				}),
@@ -324,6 +330,53 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->clientService->method('newClient')->willReturn($httpClient);
 
 		$this->expectIncomingShareStoresAccessToken('access-token-xyz');
+
+		$this->provider->shareReceived($share);
+	}
+
+	/**
+	 * When token exchange succeeds without expires_in, the access token is still
+	 * stored and the expiry remains unset.
+	 */
+	public function testShareReceivedStoresAccessTokenWithoutExpiry(): void {
+		$this->enableS2S();
+
+		$this->addressHandler->method('splitUserRemote')
+			->with('owner@example.com')
+			->willReturn(['owner', 'https://example.com/']);
+
+		$share = $this->buildShare(['must-exchange-token']);
+		$tokenEndpoint = 'https://example.com/index.php/ocm/token';
+
+		$ocmProvider = $this->createMock(IOCMProvider::class);
+		$ocmProvider->method('getTokenEndPoint')->willReturn($tokenEndpoint);
+		$ocmProvider->method('getCapabilities')->willReturn([]);
+		$this->discoveryService->method('discover')->willReturn($ocmProvider);
+
+		$this->urlGenerator->method('getAbsoluteURL')->willReturn('https://local.example/');
+		$this->signatureManager->method('signOutgoingRequestIClientPayload')
+			->willReturn([
+				'body' => 'grant_type=authorization_code&client_id=local.example&code=refresh-token-abc',
+				'headers' => ['Content-Type' => 'application/x-www-form-urlencoded', 'Signature' => 'sig'],
+				'timeout' => 10,
+				'connect_timeout' => 10,
+			]);
+
+		$response = $this->createMock(IResponse::class);
+		$response->method('getStatusCode')->willReturn(200);
+		$response->method('getBody')->willReturn(json_encode([
+			'access_token' => 'access-token-no-expiry',
+			'token_type' => 'Bearer',
+		]));
+
+		$httpClient = $this->createMock(\OCP\Http\Client\IClient::class);
+		$httpClient->method('post')->willReturn($response);
+		$this->clientService->method('newClient')->willReturn($httpClient);
+
+		$this->expectIncomingShareStoresAccessToken(
+			'access-token-no-expiry',
+			static fn ($expiresAt): bool => $expiresAt === null,
+		);
 
 		$this->provider->shareReceived($share);
 	}
