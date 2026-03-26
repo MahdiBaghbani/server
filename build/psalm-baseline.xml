@@ -831,12 +831,6 @@
     <InvalidOperand>
       <code><![CDATA[$query->getCursor()]]></code>
     </InvalidOperand>
-    <InvalidPropertyAssignmentValue>
-      <code><![CDATA[[
-		'ATTENDEE' => ['CN'],
-		'ORGANIZER' => ['CN'],
-	]]]></code>
-    </InvalidPropertyAssignmentValue>
     <UndefinedMethod>
       <code><![CDATA[getDateTime]]></code>
       <code><![CDATA[getDateTime]]></code>
@@ -2370,12 +2364,6 @@
       <code><![CDATA[FakeTranslationProvider]]></code>
     </DeprecatedInterface>
   </file>
-  <file src="apps/theming/lib/Capabilities.php">
-    <DeprecatedMethod>
-      <code><![CDATA[getAppValue]]></code>
-      <code><![CDATA[getUserValue]]></code>
-    </DeprecatedMethod>
-  </file>
   <file src="apps/theming/lib/Command/UpdateConfig.php">
     <DeprecatedMethod>
       <code><![CDATA[getAppValue]]></code>
@@ -2420,6 +2408,9 @@
     </DeprecatedMethod>
   </file>
   <file src="apps/theming/lib/Listener/BeforeTemplateRenderedListener.php">
+    <DeprecatedClass>
+      <code><![CDATA[JSDataService::class]]></code>
+    </DeprecatedClass>
     <DeprecatedMethod>
       <code><![CDATA[getUserValue]]></code>
     </DeprecatedMethod>
