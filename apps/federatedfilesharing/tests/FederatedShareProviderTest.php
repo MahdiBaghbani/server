@@ -11,6 +11,8 @@ namespace OCA\FederatedFileSharing\Tests;
 use LogicException;
 use OC\Authentication\Token\PublicKeyTokenProvider;
 use OC\Federation\CloudIdManager;
+use OCA\DAV\Db\OcmTokenMap;
+use OCA\DAV\Db\OcmTokenMapMapper;
 use OCA\FederatedFileSharing\AddressHandler;
 use OCA\FederatedFileSharing\FederatedShareProvider;
 use OCA\FederatedFileSharing\Notifications;
@@ -173,7 +175,9 @@ class FederatedShareProviderTest extends \Test\TestCase {
 				'shareOwner',
 				'shareOwner@http://localhost',
 				'sharedBy',
-				'sharedBy@http://localhost'
+				'sharedBy@http://localhost',
+				IShare::TYPE_REMOTE,
+				19
 			)
 			->willReturn(true);
 
@@ -256,7 +260,9 @@ class FederatedShareProviderTest extends \Test\TestCase {
 				'shareOwner',
 				'shareOwner@http://localhost',
 				'sharedBy',
-				'sharedBy@http://localhost'
+				'sharedBy@http://localhost',
+				IShare::TYPE_REMOTE,
+				19
 			)->willReturn(false);
 
 		$this->rootFolder->method('getById')
@@ -310,7 +316,9 @@ class FederatedShareProviderTest extends \Test\TestCase {
 				'shareOwner',
 				'shareOwner@http://localhost',
 				'sharedBy',
-				'sharedBy@http://localhost'
+				'sharedBy@http://localhost',
+				IShare::TYPE_REMOTE,
+				19
 			)->willThrowException(new \Exception('dummy'));
 
 		$this->rootFolder->method('getById')
@@ -400,7 +408,9 @@ class FederatedShareProviderTest extends \Test\TestCase {
 				'shareOwner',
 				'shareOwner@http://localhost',
 				'sharedBy',
-				'sharedBy@http://localhost'
+				'sharedBy@http://localhost',
+				IShare::TYPE_REMOTE,
+				19
 			)->willReturn(true);
 
 		$this->rootFolder->expects($this->never())->method($this->anything());
@@ -472,7 +482,9 @@ class FederatedShareProviderTest extends \Test\TestCase {
 				$owner,
 				$owner . '@http://localhost',
 				$sharedBy,
-				$sharedBy . '@http://localhost'
+				$sharedBy . '@http://localhost',
+				IShare::TYPE_REMOTE,
+				19
 			)->willReturn(true);
 
 		$this->provider->expects($this->never())->method('sendPermissionUpdate');
@@ -837,6 +849,91 @@ class FederatedShareProviderTest extends \Test\TestCase {
 			[false, 'yes', false],
 			[false, 'no', false],
 		];
+	}
+
+	public function testGetShareByTokenResolvesMappedAccessToken(): void {
+		$node = $this->createMock(File::class);
+		$node->method('getId')->willReturn(42);
+		$node->method('getName')->willReturn('myFile');
+
+		$this->addressHandler->method('generateRemoteURL')
+			->willReturn('http://localhost/');
+		$this->notifications->method('sendRemoteShare')
+			->willReturn(true);
+		$this->contactsManager->expects($this->any())
+			->method('search')
+			->willReturn([]);
+
+		$share = $this->shareManager->newShare();
+		$share->setSharedWith('user@server.com')
+			->setSharedBy('sharedBy')
+			->setShareOwner('shareOwner')
+			->setPermissions(19)
+			->setShareType(IShare::TYPE_REMOTE)
+			->setNode($node)
+			->setTarget('');
+		$share = $this->provider->create($share);
+
+		$accessTokenDb = $this->createConfiguredMock(IToken::class, [
+			'getId' => 1234,
+		]);
+
+		$tokenProvider = Server::get(PublicKeyTokenProvider::class);
+		$tokenProvider->expects($this->once())
+			->method('getToken')
+			->with('mapped-access-token')
+			->willReturn($accessTokenDb);
+
+		$mapping = new OcmTokenMap();
+		$mapping->setAccessTokenId(1234);
+		$mapping->setRefreshToken($share->getToken());
+		$mapping->setExpires(time() + 300);
+
+		$mapper = $this->createMock(OcmTokenMapMapper::class);
+		$mapper->expects($this->once())
+			->method('getByAccessTokenId')
+			->with(1234)
+			->willReturn($mapping);
+		$this->overwriteService(OcmTokenMapMapper::class, $mapper);
+
+		$resolved = $this->provider->getShareByToken('mapped-access-token');
+		$this->assertSame($share->getId(), $resolved->getId());
+		$this->assertSame($share->getToken(), $resolved->getToken());
+	}
+
+	public function testGetShareByTokenSupportsLegacyShortToken(): void {
+		$node = $this->createMock(File::class);
+		$node->method('getId')->willReturn(42);
+		$node->method('getName')->willReturn('myFile');
+
+		$this->addressHandler->method('generateRemoteURL')
+			->willReturn('http://localhost/');
+		$this->notifications->method('sendRemoteShare')
+			->willReturn(true);
+		$this->contactsManager->expects($this->any())
+			->method('search')
+			->willReturn([]);
+
+		$share = $this->shareManager->newShare();
+		$share->setSharedWith('user@server.com')
+			->setSharedBy('sharedBy')
+			->setShareOwner('shareOwner')
+			->setPermissions(19)
+			->setShareType(IShare::TYPE_REMOTE)
+			->setNode($node)
+			->setTarget('');
+		$share = $this->provider->create($share);
+
+		$legacyToken = 'legacyshorttok15';
+		$qb = $this->connection->getQueryBuilder();
+		$qb->update('share')
+			->set('token', $qb->createNamedParameter($legacyToken))
+			->where($qb->expr()->eq('id', $qb->createNamedParameter($share->getId())))
+			->executeStatement();
+
+		$resolved = $this->provider->getShareByToken($legacyToken);
+		$this->assertSame($share->getId(), $resolved->getId());
+		$this->assertSame($legacyToken, $resolved->getToken());
 	}
 
 	public function testGetSharesInFolder(): void {
