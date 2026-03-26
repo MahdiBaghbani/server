@@ -51,10 +51,6 @@ class BearerAuth extends AbstractBearer {
 			$this->userSession->tryTokenLogin($this->request);
 			$loggedIn = $this->userSession->isLoggedIn();
 		}
-		if (!$loggedIn) {
-			$this->userSession->doTryTokenLogin($bearerToken);
-			$loggedIn = $this->userSession->isLoggedIn();
-		}
 		if ($loggedIn) {
 			return $this->setupUserFs($this->userSession->getUser()->getUID());
 		}
