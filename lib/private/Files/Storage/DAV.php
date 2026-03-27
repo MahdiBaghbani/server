@@ -391,6 +391,12 @@ class DAV extends Common {
 	private bool $retryingAuth = false;
 
 	/**
+	 * Set by the 401 retry path so subclasses can ignore their local expiry
+	 * shortcut and perform a real refresh after the remote rejected the bearer.
+	 */
+	protected bool $forceTokenRefresh = false;
+
+	/**
 	 * Execute an operation with automatic retry on 401 Unauthorized when using Bearer auth.
 	 * Handles both Sabre ClientHttpException and Guzzle ClientException.
 	 *
@@ -428,11 +434,13 @@ class DAV extends Common {
 	private function retryWithFreshToken(callable $operation): mixed {
 		$this->retryingAuth = true;
 		try {
+			$this->forceTokenRefresh = true;
 			if (!$this->refreshBearerToken()) {
 				throw new StorageNotAvailableException('Failed to refresh bearer token');
 			}
 			return $operation();
 		} finally {
+			$this->forceTokenRefresh = false;
 			$this->retryingAuth = false;
 		}
 	}

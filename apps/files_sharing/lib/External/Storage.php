@@ -145,7 +145,7 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	 * processes can detect that another process already obtained a fresh token
 	 * and reuse it rather than performing a redundant exchange.
 	 *
-	 * After a failed exchange, a 60-second backoff is applied so that
+	 * After a failed exchange, a 5-second backoff is applied so that
 	 * subsequent file operations do not hammer the remote token endpoint.
 	 * The DB is still consulted during backoff in case a concurrent process
 	 * succeeded; only the outgoing exchange call is suppressed.
@@ -155,18 +155,21 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	protected function refreshBearerToken(): bool {
 		$now = time();
 
-		// Fast path: in-memory token is still valid (single-process guard).
-		if ($this->tokenExpiresAt > $now) {
+		// In the common case, a locally unexpired bearer means this process does
+		// not need to exchange again. A real remote 401 overrides that shortcut.
+		if (!$this->forceTokenRefresh && $this->tokenExpiresAt > $now) {
 			return false;
 		}
 
-		// Slow path: check DB — a concurrent process may have already refreshed.
+		// Another process may have refreshed first, so look for newer bearer
+		// state in the database before making our own exchange call.
 		$share = $this->manager->getShareByToken($this->token);
 		if ($share !== false) {
 			$dbExpiry = $share->getAccessTokenExpires();
 			$dbToken = $share->getAccessToken();
-			if ($dbExpiry !== null && $dbExpiry > $now && $dbToken !== null) {
-				// Another process already refreshed — reuse DB token and reset failure state.
+			if ($dbExpiry !== null && $dbExpiry > $now && $dbToken !== null && $dbToken !== $this->password) {
+				// Reuse a fresh DB token, but never "refresh" into the same stale
+				// bearer value that already triggered the 401 in this process.
 				$this->password = $dbToken;
 				$this->tokenExpiresAt = $dbExpiry;
 				$this->refreshFailureCount = 0;
@@ -179,23 +182,27 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			}
 		}
 
-		// Gave up after max attempts: stop trying for the lifetime of this instance.
+		// After enough failures, stop exchanging again for the lifetime of this instance.
 		if ($this->refreshFailureCount >= self::REFRESH_MAX_ATTEMPTS) {
 			return false;
 		}
 
-		// Still within the inter-attempt wait: don't hit the endpoint yet.
+		// Respect the short backoff window between failed exchange attempts.
 		if ($this->refreshBackoffUntil > $now) {
 			return false;
 		}
 
-		// No valid token in DB — perform the exchange ourselves.
+		// No reusable bearer was found, so this process has to exchange the
+		// refresh token itself.
 		try {
 			$tokenResponse = $this->exchangeRefreshTokenResponse();
 			$expiresIn = $tokenResponse['expiresIn'] ?? null;
 			// Fall back to the legacy 1-hour window only when the remote omits expiry metadata.
 			$expiresAt = $now + (($expiresIn !== null && $expiresIn > 0) ? $expiresIn : 3600);
-			$newAccessToken = $tokenResponse['accessToken'];
+			$newAccessToken = $tokenResponse['accessToken'] ?? null;
+			if (!is_string($newAccessToken) || $newAccessToken === '') {
+				throw new StorageNotAvailableException('Could not obtain access token: missing accessToken field');
+			}
 			$this->password = $newAccessToken;
 			$this->tokenExpiresAt = $expiresAt;
 			$this->refreshFailureCount = 0;
@@ -397,9 +404,10 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$url,
 			'ocm',
 			static function (mixed $data): bool {
-				// Minimal OCM discovery shape: enabled flag, endpoint, and resource list.
+				// enabled:false still means the discovery document exists, but it must
+				// not count as an active OCM endpoint for this remote.
 				return is_object($data)
-					&& isset($data->enabled)
+					&& (($data->enabled ?? null) === true)
 					&& !empty($data->endPoint)
 					&& is_array($data->resourceTypes ?? null);
 			}
