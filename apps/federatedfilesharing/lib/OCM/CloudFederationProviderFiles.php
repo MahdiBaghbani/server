@@ -123,7 +123,8 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 		$accessTokenExpires = null;
 
 		if ($mustExchangeToken) {
-			// Exchange the sharedSecret for an access token (required)
+			// must-exchange-token is part of the sender contract, so reject the
+			// share if we cannot turn the shared secret into bearer credentials.
 			$tokenExchange = $this->exchangeToken($remote, $token);
 			if ($tokenExchange === null) {
 				throw new ProviderCouldNotAddShareException('Failed to exchange token as required by must-exchange-token', '', Http::STATUS_BAD_REQUEST);
@@ -131,14 +132,17 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 			$accessToken = $tokenExchange['accessToken'];
 			$accessTokenExpires = $tokenExchange['expiresAt'];
 		} else {
-			// Check if remote has exchange-token capability and try to exchange (optional)
+			// exchange-token capability is only an optimization here. If the
+			// optional exchange fails, keep accepting the share without token data.
 			try {
 				$ocmProvider = $this->discoveryService->discover(rtrim($remote, '/'));
 				$capabilities = $ocmProvider->getCapabilities();
 				if (in_array('exchange-token', $capabilities)) {
 					$tokenExchange = $this->exchangeToken($remote, $token);
-					$accessToken = $tokenExchange['accessToken'] ?? null;
-					$accessTokenExpires = $tokenExchange['expiresAt'] ?? null;
+					if ($tokenExchange !== null) {
+						$accessToken = $tokenExchange['accessToken'] ?? null;
+						$accessTokenExpires = $tokenExchange['expiresAt'] ?? null;
+					}
 					$this->logger->debug('Exchanged token for remote with exchange-token capability', ['remote' => $remote, 'success' => $accessToken !== null]);
 				}
 			} catch (\Exception $e) {

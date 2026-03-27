@@ -183,6 +183,26 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->expectExceptionMessage('internal server error, was not able to add share from https://example.com/');
 	}
 
+	private function expectIncomingShareWithoutAccessToken(): void {
+		$user = $this->createMock(IUser::class);
+
+		$this->userManager->method('get')->with('localuser')->willReturn($user);
+		$this->filenameValidator->method('isFilenameValid')->willReturn(true);
+		$this->externalShareManager->expects($this->once())
+			->method('addShare')
+			->with(
+				$this->callback(function (ExternalShare $externalShare): bool {
+					return $externalShare->getAccessToken() === null
+						&& $externalShare->getAccessTokenExpires() === null;
+				}),
+				$user,
+			)
+			->willThrowException(new \RuntimeException('stop after null access token assertion'));
+
+		$this->expectException(ProviderCouldNotAddShareException::class);
+		$this->expectExceptionMessage('internal server error, was not able to add share from https://example.com/');
+	}
+
 	/**
 	 * When must-exchange-token is required but the remote has no token endpoint,
 	 * shareReceived must throw rather than silently accept the share.
@@ -330,6 +350,30 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->clientService->method('newClient')->willReturn($httpClient);
 
 		$this->expectIncomingShareStoresAccessToken('access-token-xyz');
+
+		$this->provider->shareReceived($share);
+	}
+
+	/**
+	 * When exchange-token capability is present but the optional exchange returns
+	 * null, shareReceived should continue without token data.
+	 */
+	public function testShareReceivedOptionalExchangeContinuesWhenExchangeReturnsNull(): void {
+		$this->enableS2S();
+
+		$this->addressHandler->method('splitUserRemote')
+			->with('owner@example.com')
+			->willReturn(['owner', 'https://example.com/']);
+
+		$share = $this->buildShare();
+
+		$ocmProvider = $this->createMock(IOCMProvider::class);
+		$ocmProvider->method('getCapabilities')->willReturn(['exchange-token']);
+		$ocmProvider->method('getTokenEndPoint')->willReturn('');
+
+		$this->discoveryService->method('discover')->willReturn($ocmProvider);
+
+		$this->expectIncomingShareWithoutAccessToken();
 
 		$this->provider->shareReceived($share);
 	}
