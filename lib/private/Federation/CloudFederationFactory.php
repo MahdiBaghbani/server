@@ -43,7 +43,8 @@ class CloudFederationFactory implements ICloudFederationFactory {
 	public function getCloudFederationShare($shareWith, $name, $description, $providerId, $owner, $ownerDisplayName, $sharedBy, $sharedByDisplayName, $sharedSecret, $shareType, $resourceType, $permissions = null) {
 		$useExchangeToken = false;
 		$remoteDomain = null;
-		// Exchange-token shares must point back to the sender's own DAV root.
+		// OCM 1.1 exchange-token shares advertise the sender's own DAV endpoint.
+		// Keep that URL sender-owned instead of reconstructing it from the remote.
 		$senderWebdavUri = $this->getLocalProtocolEndpoint('file', 'webdav');
 
 		try {
@@ -55,8 +56,9 @@ class CloudFederationFactory implements ICloudFederationFactory {
 				$capabilities = $remoteProvider->getCapabilities();
 
 				$useExchangeToken = in_array('exchange-token', $capabilities, true);
-				// Without a sender-owned DAV endpoint we would emit a broken OCM 1.1 payload,
-				// so keep using the legacy path instead.
+				// Exchange-token shares need a concrete sender DAV endpoint in the
+				// outgoing payload. If local discovery cannot provide one, keep the
+				// legacy share flow instead of sending a broken OCM 1.1 payload.
 				if ($useExchangeToken && $senderWebdavUri === null) {
 					$useExchangeToken = false;
 					$this->logger->warning('Missing local webdav endpoint, falling back to legacy share method', [
@@ -95,7 +97,6 @@ class CloudFederationFactory implements ICloudFederationFactory {
 			$resourceType,
 			$sharedSecret,
 			$useExchangeToken,
-			$remoteDomain,
 			$permissions,
 			$senderWebdavUri
 		);
@@ -137,8 +138,9 @@ class CloudFederationFactory implements ICloudFederationFactory {
 	}
 
 	/**
-	 * Local discovery currently exposes protocol roots as relative paths, so fold
-	 * them onto the discovered endpoint origin before sending them out.
+	 * Local discovery advertises protocol roots as relative paths. Preserve the
+	 * app prefix from the discovered endpoint so subdirectory installs keep
+	 * `/nextcloud/...` style paths when those roots are sent to other servers.
 	 */
 	private function buildAbsoluteProtocolUrl(string $endpoint, string $protocolPath): string {
 		if (preg_match('/^https?:\/\//i', $protocolPath) === 1) {
@@ -155,6 +157,15 @@ class CloudFederationFactory implements ICloudFederationFactory {
 			$origin .= ':' . $parts['port'];
 		}
 
-		return rtrim($origin, '/') . '/' . ltrim($protocolPath, '/');
+		$endpointPath = $parts['path'] ?? '';
+		if ($endpointPath === '' || $endpointPath === '/') {
+			$appPath = '';
+		} else {
+			$normalizedEndpointPath = rtrim($endpointPath, '/');
+			$lastSeparator = strrpos($normalizedEndpointPath, '/');
+			$appPath = $lastSeparator > 0 ? substr($normalizedEndpointPath, 0, $lastSeparator) : '';
+		}
+
+		return $origin . $appPath . '/' . ltrim($protocolPath, '/');
 	}
 }

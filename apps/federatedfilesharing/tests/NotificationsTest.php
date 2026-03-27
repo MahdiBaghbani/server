@@ -145,7 +145,28 @@ class NotificationsTest extends \Test\TestCase {
 		];
 	}
 
-	public function testSendRemoteShareUsesPermissionsInExchangeTokenPayload(): void {
+	public static function dataExchangeTokenPayloadEndpoints(): array {
+		return [
+			'root mounted endpoint' => [
+				'https://local.example/ocm',
+				'https://local.example/public.php/dav/files/sender',
+			],
+			'subdirectory endpoint' => [
+				'https://local.example/nextcloud/ocm-provider',
+				'https://local.example/nextcloud/public.php/dav/files/sender',
+			],
+			'nested trailing slash endpoint' => [
+				'https://local.example/a/b/ocm-provider/',
+				'https://local.example/a/b/public.php/dav/files/sender',
+			],
+		];
+	}
+
+	#[\PHPUnit\Framework\Attributes\DataProvider(methodName: 'dataExchangeTokenPayloadEndpoints')]
+	public function testSendRemoteShareUsesPermissionsInExchangeTokenPayload(
+		string $localEndpoint,
+		string $expectedWebdavUri,
+	): void {
 		$this->addressHandler->expects(self::once())
 			->method('splitUserRemote')
 			->with('remoteuser@remote.example')
@@ -175,7 +196,7 @@ class NotificationsTest extends \Test\TestCase {
 
 		$localProvider = $this->createMock(IOCMProvider::class);
 		$localProvider->method('getResourceTypes')->willReturn([$localResource]);
-		$localProvider->method('getEndPoint')->willReturn('https://local.example/ocm');
+		$localProvider->method('getEndPoint')->willReturn($localEndpoint);
 
 		$remoteProvider = $this->createMock(IOCMProvider::class);
 		$remoteProvider->method('getCapabilities')->willReturn(['exchange-token']);
@@ -213,13 +234,13 @@ class NotificationsTest extends \Test\TestCase {
 
 		$this->cloudFederationProviderManager->expects(self::once())
 			->method('sendShare')
-			->with(self::callback(static function (ICloudFederationShare $share): bool {
+			->with(self::callback(static function (ICloudFederationShare $share) use ($expectedWebdavUri): bool {
 				self::assertInstanceOf(CloudFederationShare::class, $share);
 
 				$protocol = $share->getProtocol();
 				self::assertSame('webdav', $protocol['name']);
 				self::assertSame(
-					'https://local.example/public.php/dav/files/sender',
+					$expectedWebdavUri,
 					$protocol['webdav']['uri']
 				);
 				self::assertSame(

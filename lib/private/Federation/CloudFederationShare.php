@@ -42,7 +42,6 @@ class CloudFederationShare implements ICloudFederationShare {
 	 * @param string $resourceType ('file', 'calendar',...)
 	 * @param string $sharedSecret
 	 * @param bool $useExchangeToken whether to use exchange-token protocol (new way) or sharedSecret (old way)
-	 * @param string|null $remoteDomain remote domain discovered for the share
 	 * @param int|null $permissions share permission bitmask
 	 * @param string|null $senderWebdavUri sender-owned webdav endpoint
 	 */
@@ -58,7 +57,6 @@ class CloudFederationShare implements ICloudFederationShare {
 		$resourceType = '',
 		$sharedSecret = '',
 		$useExchangeToken = false,
-		$remoteDomain = null,
 		$permissions = null,
 		$senderWebdavUri = null,
 	) {
