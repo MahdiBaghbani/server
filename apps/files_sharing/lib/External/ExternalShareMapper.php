@@ -56,8 +56,19 @@ class ExternalShareMapper extends QBMapper {
 		$qb->select('*')
 			->from(self::TABLE_NAME)
 			->where($qb->expr()->eq('share_token', $qb->createNamedParameter($token, IQueryBuilder::PARAM_STR)))
+			->orderBy('id', 'ASC')
 			->setMaxResults(1);
 		return $this->findEntity($qb);
+	}
+
+	public function updateAccessTokenByShareToken(string $shareToken, string $accessToken, int $expiresAt): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update(self::TABLE_NAME)
+			->set('access_token', $qb->createNamedParameter($accessToken, IQueryBuilder::PARAM_STR))
+			->set('access_token_expires', $qb->createNamedParameter($expiresAt, IQueryBuilder::PARAM_INT))
+			->where($qb->expr()->eq('share_token', $qb->createNamedParameter($shareToken, IQueryBuilder::PARAM_STR)));
+
+		return $qb->executeStatement();
 	}
 
 	/**

@@ -579,11 +579,16 @@ class Manager {
 	 */
 	public function updateAccessToken(string $shareToken, string $accessToken, int $expiresAt): void {
 		try {
-			$share = $this->externalShareMapper->getShareByToken($shareToken);
-			$share->setAccessToken($accessToken);
-			$share->setAccessTokenExpires($expiresAt);
-			$this->externalShareMapper->update($share);
-			$this->logger->debug('Updated access token for share', ['shareToken' => substr($shareToken, 0, 8) . '...']);
+			$updatedRows = $this->externalShareMapper->updateAccessTokenByShareToken($shareToken, $accessToken, $expiresAt);
+			if ($updatedRows === 0) {
+				$this->logger->warning('Could not find share to update access token', ['shareToken' => substr($shareToken, 0, 8) . '...']);
+				return;
+			}
+
+			$this->logger->debug('Updated access token for share rows', [
+				'shareToken' => substr($shareToken, 0, 8) . '...',
+				'updatedRows' => $updatedRows,
+			]);
 		} catch (DoesNotExistException $e) {
 			$this->logger->warning('Could not find share to update access token', ['shareToken' => substr($shareToken, 0, 8) . '...']);
 		} catch (Exception $e) {
