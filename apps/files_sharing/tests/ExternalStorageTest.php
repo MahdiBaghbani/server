@@ -246,6 +246,77 @@ class ExternalStorageTest extends \Test\TestCase {
 		$this->assertGreaterThanOrEqual($now + 3590, $storage->getTokenExpiry());
 	}
 
+	// These three cases lock the upgrade regression down:
+	// short legacy tokens must stay on basic auth, while long code-flow tokens
+	// may use bearer auth only when discovery also advertises exchange-token.
+	public function testLegacyShortTokenStaysBasicWithExchangeTokenCapability(): void {
+		$remote = 'https://legacy-share.example';
+		$storage = $this->getTestStorageWithGetBodies($remote, [
+			$remote . '/.well-known/ocm' => json_encode([
+				'enabled' => true,
+				'endPoint' => $remote . '/ocm',
+				'resourceTypes' => [[
+					'name' => 'file',
+					'shareTypes' => ['user'],
+					'protocols' => ['webdav' => '/public.php/webdav'],
+				]],
+				'capabilities' => ['shares', 'exchange-token'],
+			]),
+		]);
+
+		$this->assertFalse($storage->usesBearerAuth());
+	}
+
+	public function testExchangeTokenCapabilityUsesBearerForLongShareToken(): void {
+		$remote = 'https://codeflow-share.example';
+		$storage = $this->getTestStorageWithGetBodies(
+			$remote,
+			[
+				$remote . '/.well-known/ocm' => json_encode([
+					'enabled' => true,
+					'endPoint' => $remote . '/ocm',
+					'resourceTypes' => [[
+						'name' => 'file',
+						'shareTypes' => ['user'],
+						'protocols' => ['webdav' => '/public.php/webdav'],
+					]],
+					'capabilities' => ['shares', 'exchange-token'],
+				]),
+			],
+			null,
+			[
+				'token' => str_repeat('a', 32),
+			]
+		);
+
+		$this->assertTrue($storage->usesBearerAuth());
+	}
+
+	public function testLongShareTokenWithoutExchangeTokenCapabilityStaysBasic(): void {
+		$remote = 'https://legacy-capability.example';
+		$storage = $this->getTestStorageWithGetBodies(
+			$remote,
+			[
+				$remote . '/.well-known/ocm' => json_encode([
+					'enabled' => true,
+					'endPoint' => $remote . '/ocm',
+					'resourceTypes' => [[
+						'name' => 'file',
+						'shareTypes' => ['user'],
+						'protocols' => ['webdav' => '/public.php/webdav'],
+					]],
+					'capabilities' => ['shares'],
+				]),
+			],
+			null,
+			[
+				'token' => str_repeat('b', 32),
+			]
+		);
+
+		$this->assertFalse($storage->usesBearerAuth());
+	}
+
 	public function testOwnCloudStatusDetectionRejectsRevaProduct(): void {
 		$remote = 'https://remoteserver';
 		$storage = $this->getTestStorageWithGetBodies($remote, [
@@ -482,6 +553,10 @@ class TestSharingExternalStorage extends Storage {
 
 	public function runWithAuthRetry(callable $operation): mixed {
 		return $this->withAuthRetry($operation);
+	}
+
+	public function usesBearerAuth(): bool {
+		return $this->isBearerAuth();
 	}
 
 	protected function exchangeRefreshTokenResponse(): array {

@@ -11,6 +11,7 @@ namespace OCA\Files_Sharing\External;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
+use OC\Authentication\Token\PublicKeyTokenProvider;
 use OC\Files\Storage\DAV;
 use OC\ForbiddenException;
 use OC\Share\Share;
@@ -77,16 +78,18 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 		$this->appConfig = Server::get(IAppConfig::class);
 		$this->shareManager = Server::get(IShareManager::class);
 
-		// use default path to webdav if not found on discovery
+		// Default to basic auth unless we can prove this share is on the
+		// exchange-token path. That keeps pre-upgrade legacy shares from being
+		// pushed onto bearer auth just because the sender now advertises it.
+		$hasStoredAccessToken = !empty($options['access_token']);
+		$shareTokenSupportsExchange = $this->shareTokenSupportsExchange($options['token'] ?? null);
+		$discoverySupportsExchangeToken = false;
 		try {
 			$ocmProvider = $discoveryService->discover($this->cloudId->getRemote());
 			$webDavEndpoint = $ocmProvider->extractProtocolEntry('file', 'webdav');
 			$remote = $ocmProvider->getEndPoint();
 			$authType = \Sabre\DAV\Client::AUTH_BASIC;
-			$capabilities = $ocmProvider->getCapabilities();
-			if (in_array('exchange-token', $capabilities)) {
-				$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
-			}
+			$discoverySupportsExchangeToken = in_array('exchange-token', $ocmProvider->getCapabilities(), true);
 		} catch (OCMProviderException|OCMArgumentException $e) {
 			$this->logger->notice('exception while retrieving webdav endpoint', ['exception' => $e]);
 			$webDavEndpoint = '/public.php/webdav';
@@ -94,9 +97,14 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			$authType = \Sabre\DAV\Client::AUTH_BASIC;
 		}
 
-		// If we have a stored access token, use Bearer auth regardless of discovery.
-		// This handles the case where the share was created with must-exchange-token.
-		if (!empty($options['access_token'])) {
+		// Sender discovery alone is not enough here. Legacy outgoing shares used
+		// short tokens that were intentionally left outside the sender's token
+		// provider, so they can never complete the bearer exchange after upgrade.
+		//
+		// New code-flow shares use provider-backed tokens. Those tokens are long
+		// enough to identify the exchange-token path even before the receiver has
+		// stored its first access token, so they should still use bearer auth.
+		if ($hasStoredAccessToken || ($discoverySupportsExchangeToken && $shareTokenSupportsExchange)) {
 			$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
 		}
 
@@ -227,6 +235,13 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			]);
 			return false;
 		}
+	}
+
+	private function shareTokenSupportsExchange(?string $shareToken): bool {
+		// Branch-local heuristic: provider-backed share codes created by this
+		// code-flow branch satisfy TOKEN_MIN_LENGTH. Preserved legacy share
+		// secrets are shorter and must stay on the basic-auth path.
+		return $shareToken !== null && strlen($shareToken) >= PublicKeyTokenProvider::TOKEN_MIN_LENGTH;
 	}
 
 	public function getWatcher(string $path = '', ?IStorage $storage = null): IWatcher {
