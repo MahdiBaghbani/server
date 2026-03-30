@@ -177,6 +177,18 @@ class Manager {
 	}
 
 	/**
+	 * Session-free read for Storage to load a mounted row before calling the
+	 * resolver. No user or access check -- caller must already hold the row id.
+	 */
+	public function getShareByIdInternal(string $id): ExternalShare|false {
+		try {
+			return $this->externalShareMapper->getById($id);
+		} catch (DoesNotExistException) {
+			return false;
+		}
+	}
+
+	/**
 	 * @throws Exception
 	 */
 	private function updateSubShare(ExternalShare $externalShare, IUser $user, ?string $mountPoint, int $accepted): ExternalShare {
