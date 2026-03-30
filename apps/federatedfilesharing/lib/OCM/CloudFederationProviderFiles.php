@@ -17,6 +17,7 @@ use OCA\Files_Sharing\External\ExternalShareMapper;
 use OCA\Files_Sharing\External\Manager;
 use OCA\Files_Sharing\Service\ExchangeOutcome;
 use OCA\Files_Sharing\Service\TokenExchangeHelper;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
 use OCA\GlobalSiteSelector\Service\SlaveService;
 use OCA\Polls\Db\Share;
 use OCP\Activity\IManager as IActivityManager;
@@ -115,6 +116,7 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 		$mustExchangeToken = in_array('must-exchange-token', $requirements);
 		$accessToken = null;
 		$accessTokenExpires = null;
+		$tokenExchangeMode = null;
 
 		/** @var TokenExchangeHelper $exchangeHelper */
 		$exchangeHelper = Server::get(TokenExchangeHelper::class);
@@ -124,10 +126,19 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 			if ($result->outcome !== ExchangeOutcome::Success) {
 				throw new ProviderCouldNotAddShareException('Failed to exchange token as required by must-exchange-token', '', Http::STATUS_BAD_REQUEST);
 			}
+			$tokenExchangeMode = TokenExchangeMode::EXCHANGE_REQUIRED;
 			$accessToken = $result->accessToken;
 			$accessTokenExpires = $result->accessTokenExpires;
 		} else {
 			$result = $exchangeHelper->exchange($remote, $token);
+			$tokenExchangeMode = match ($result->outcome) {
+				ExchangeOutcome::Success => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				ExchangeOutcome::DefinitiveNoCapability => TokenExchangeMode::LEGACY,
+				ExchangeOutcome::DefinitiveInvalidGrant => TokenExchangeMode::LEGACY,
+				ExchangeOutcome::ExplicitInvalidRequest,
+				ExchangeOutcome::MalformedResponse,
+				ExchangeOutcome::TransientFailure => TokenExchangeMode::EXCHANGE_OPTIONAL,
+			};
 			if ($result->outcome === ExchangeOutcome::Success) {
 				$accessToken = $result->accessToken;
 				$accessTokenExpires = $result->accessTokenExpires;
@@ -135,6 +146,7 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 			$this->logger->debug('Optional token exchange attempted', [
 				'remote' => $remote,
 				'outcome' => $result->outcome->value,
+				'resolvedMode' => $tokenExchangeMode,
 			]);
 		}
 
@@ -188,6 +200,7 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 			$externalShare->setName($name);
 			$externalShare->setOwner($owner);
 			$externalShare->setShareType($shareType);
+			$externalShare->setTokenExchangeMode($tokenExchangeMode);
 			$externalShare->setAccepted(IShare::STATUS_PENDING);
 
 			try {

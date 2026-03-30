@@ -17,6 +17,7 @@ use OCA\Files_Sharing\External\Manager;
 use OCA\Files_Sharing\Service\ExchangeOutcome;
 use OCA\Files_Sharing\Service\ExchangeResult;
 use OCA\Files_Sharing\Service\TokenExchangeHelper;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
 use OCP\Activity\IManager as IActivityManager;
 use OCP\App\IAppManager;
 use OCP\Federation\Exceptions\ProviderCouldNotAddShareException;
@@ -142,7 +143,7 @@ class CloudFederationProviderFilesTest extends TestCase {
 		return $share;
 	}
 
-	private function expectIncomingShareStoresAccessToken(string $expectedToken, ?callable $assertExpiry = null): void {
+	private function expectIncomingShareStoresAccessToken(string $expectedToken, string $expectedMode, ?callable $assertExpiry = null): void {
 		$user = $this->createMock(IUser::class);
 
 		$this->userManager->method('get')->with('localuser')->willReturn($user);
@@ -150,10 +151,14 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->externalShareManager->expects($this->once())
 			->method('addShare')
 			->with(
-				$this->callback(function (ExternalShare $externalShare) use ($expectedToken, $assertExpiry) {
+				$this->callback(function (ExternalShare $externalShare) use ($expectedToken, $expectedMode, $assertExpiry) {
 					$expiresAt = $externalShare->getAccessTokenExpires();
 
 					if ($externalShare->getAccessToken() !== $expectedToken || $externalShare->getPassword() !== null) {
+						return false;
+					}
+
+					if ($externalShare->getTokenExchangeMode() !== $expectedMode) {
 						return false;
 					}
 
@@ -174,7 +179,7 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->expectExceptionMessage('internal server error, was not able to add share from https://example.com/');
 	}
 
-	private function expectIncomingShareWithoutAccessToken(): void {
+	private function expectIncomingShareWithoutAccessToken(string $expectedMode): void {
 		$user = $this->createMock(IUser::class);
 
 		$this->userManager->method('get')->with('localuser')->willReturn($user);
@@ -182,9 +187,10 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->externalShareManager->expects($this->once())
 			->method('addShare')
 			->with(
-				$this->callback(function (ExternalShare $externalShare): bool {
+				$this->callback(function (ExternalShare $externalShare) use ($expectedMode): bool {
 					return $externalShare->getAccessToken() === null
-						&& $externalShare->getAccessTokenExpires() === null;
+						&& $externalShare->getAccessTokenExpires() === null
+						&& $externalShare->getTokenExchangeMode() === $expectedMode;
 				}),
 				$user,
 			)
@@ -194,7 +200,20 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->expectExceptionMessage('internal server error, was not able to add share from https://example.com/');
 	}
 
-	public function testShareReceivedMustExchangeTokenThrowsWhenExchangeFails(): void {
+	public static function mustExchangeTokenRejectionProvider(): array {
+		return [
+			'definitive-no-capability' => [ExchangeOutcome::DefinitiveNoCapability],
+			'definitive-invalid-grant' => [ExchangeOutcome::DefinitiveInvalidGrant],
+			'explicit-invalid-request' => [ExchangeOutcome::ExplicitInvalidRequest],
+			'malformed-response' => [ExchangeOutcome::MalformedResponse],
+			'transient-failure' => [ExchangeOutcome::TransientFailure],
+		];
+	}
+
+	/**
+	 * @dataProvider mustExchangeTokenRejectionProvider
+	 */
+	public function testShareReceivedMustExchangeTokenThrowsOnAllNonSuccessOutcomes(ExchangeOutcome $outcome): void {
 		$this->enableS2S();
 
 		$this->addressHandler->method('splitUserRemote')
@@ -204,14 +223,14 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$share = $this->buildShare(['must-exchange-token']);
 
 		$this->exchangeHelper->method('exchange')
-			->willReturn(ExchangeResult::failure(ExchangeOutcome::DefinitiveNoCapability));
+			->willReturn(ExchangeResult::failure($outcome));
 
 		$this->expectException(ProviderCouldNotAddShareException::class);
 
 		$this->provider->shareReceived($share);
 	}
 
-	public function testShareReceivedMustExchangeTokenStoresAccessToken(): void {
+	public function testShareReceivedMustExchangeTokenStoresAccessTokenAndMode(): void {
 		$this->enableS2S();
 
 		$this->addressHandler->method('splitUserRemote')
@@ -224,7 +243,7 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->exchangeHelper->method('exchange')
 			->willReturn(ExchangeResult::success('access-token-xyz', $expiresAt));
 
-		$this->expectIncomingShareStoresAccessToken('access-token-xyz');
+		$this->expectIncomingShareStoresAccessToken('access-token-xyz', TokenExchangeMode::EXCHANGE_REQUIRED);
 
 		$this->provider->shareReceived($share);
 	}
@@ -250,7 +269,7 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->provider->shareReceived($share);
 	}
 
-	public function testShareReceivedOptionalExchangeStoresAccessTokenOnSuccess(): void {
+	public function testShareReceivedOptionalExchangeSuccessStoresBearerAndOptionalMode(): void {
 		$this->enableS2S();
 
 		$this->addressHandler->method('splitUserRemote')
@@ -263,12 +282,12 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->exchangeHelper->method('exchange')
 			->willReturn(ExchangeResult::success('access-token-xyz', $expiresAt));
 
-		$this->expectIncomingShareStoresAccessToken('access-token-xyz');
+		$this->expectIncomingShareStoresAccessToken('access-token-xyz', TokenExchangeMode::EXCHANGE_OPTIONAL);
 
 		$this->provider->shareReceived($share);
 	}
 
-	public function testShareReceivedOptionalExchangeContinuesWhenExchangeFails(): void {
+	public function testShareReceivedOptionalExchangeNoCapabilityPersistsLegacy(): void {
 		$this->enableS2S();
 
 		$this->addressHandler->method('splitUserRemote')
@@ -280,7 +299,75 @@ class CloudFederationProviderFilesTest extends TestCase {
 		$this->exchangeHelper->method('exchange')
 			->willReturn(ExchangeResult::failure(ExchangeOutcome::DefinitiveNoCapability));
 
-		$this->expectIncomingShareWithoutAccessToken();
+		$this->expectIncomingShareWithoutAccessToken(TokenExchangeMode::LEGACY);
+
+		$this->provider->shareReceived($share);
+	}
+
+	public function testShareReceivedOptionalExchangeInvalidGrantPersistsLegacy(): void {
+		$this->enableS2S();
+
+		$this->addressHandler->method('splitUserRemote')
+			->with('owner@example.com')
+			->willReturn(['owner', 'https://example.com/']);
+
+		$share = $this->buildShare();
+
+		$this->exchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::DefinitiveInvalidGrant));
+
+		$this->expectIncomingShareWithoutAccessToken(TokenExchangeMode::LEGACY);
+
+		$this->provider->shareReceived($share);
+	}
+
+	public function testShareReceivedOptionalExchangeInvalidRequestKeepsOptional(): void {
+		$this->enableS2S();
+
+		$this->addressHandler->method('splitUserRemote')
+			->with('owner@example.com')
+			->willReturn(['owner', 'https://example.com/']);
+
+		$share = $this->buildShare();
+
+		$this->exchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::ExplicitInvalidRequest));
+
+		$this->expectIncomingShareWithoutAccessToken(TokenExchangeMode::EXCHANGE_OPTIONAL);
+
+		$this->provider->shareReceived($share);
+	}
+
+	public function testShareReceivedOptionalExchangeMalformedResponseKeepsOptional(): void {
+		$this->enableS2S();
+
+		$this->addressHandler->method('splitUserRemote')
+			->with('owner@example.com')
+			->willReturn(['owner', 'https://example.com/']);
+
+		$share = $this->buildShare();
+
+		$this->exchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::MalformedResponse));
+
+		$this->expectIncomingShareWithoutAccessToken(TokenExchangeMode::EXCHANGE_OPTIONAL);
+
+		$this->provider->shareReceived($share);
+	}
+
+	public function testShareReceivedOptionalExchangeTransientFailureKeepsOptional(): void {
+		$this->enableS2S();
+
+		$this->addressHandler->method('splitUserRemote')
+			->with('owner@example.com')
+			->willReturn(['owner', 'https://example.com/']);
+
+		$share = $this->buildShare();
+
+		$this->exchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::TransientFailure));
+
+		$this->expectIncomingShareWithoutAccessToken(TokenExchangeMode::EXCHANGE_OPTIONAL);
 
 		$this->provider->shareReceived($share);
 	}
@@ -299,6 +386,7 @@ class CloudFederationProviderFilesTest extends TestCase {
 
 		$this->expectIncomingShareStoresAccessToken(
 			'access-token-no-expiry',
+			TokenExchangeMode::EXCHANGE_REQUIRED,
 			static fn ($expiresAt): bool => $expiresAt === null,
 		);
 
