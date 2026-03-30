@@ -11,12 +11,15 @@ namespace OCA\Files_Sharing\External;
 use GuzzleHttp\Exception\ClientException;
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
-use OC\Authentication\Token\PublicKeyTokenProvider;
+use OC\Files\Storage\BearerAuthAwareSabreClient;
 use OC\Files\Storage\DAV;
 use OC\ForbiddenException;
-use OC\Share\Share;
 use OCA\Files_Sharing\External\Manager as ExternalShareManager;
 use OCA\Files_Sharing\ISharedStorage;
+use OCA\Files_Sharing\Service\ExchangeOutcome;
+use OCA\Files_Sharing\Service\TokenExchangeHelper;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
+use OCA\Files_Sharing\Service\TokenExchangeModeResolver;
 use OCP\AppFramework\Http;
 use OCP\Constants;
 use OCP\Federation\ICloudId;
@@ -46,6 +49,9 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	private ICloudId $cloudId;
 	private string $mountPoint;
 	private string $token;
+	private string $shareId;
+	private string $legacyPassword;
+	private ?string $tokenExchangeMode;
 	private ICacheFactory $memcacheFactory;
 	private IClientService $httpClient;
 	private bool $updateChecked = false;
@@ -53,19 +59,16 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 	private IConfig $config;
 	protected IAppConfig $appConfig;
 	private IShareManager $shareManager;
-	private bool $tokenRefreshed = false;
-	/** Unix timestamp until which the current access token is considered valid (0 = unknown/expired) */
+	private TokenExchangeModeResolver $resolver;
+	private TokenExchangeHelper $exchangeHelper;
+	private bool $resolvingMode = false;
 	private int $tokenExpiresAt = 0;
-	/** Number of consecutive token exchange failures (resets on success or DB-reuse) */
-	private int $refreshFailureCount = 0;
-	/** Unix timestamp before which the next exchange attempt must not be made (0 = no wait) */
 	private int $refreshBackoffUntil = 0;
 
-	private const REFRESH_MAX_ATTEMPTS = 3;
 	private const REFRESH_BACKOFF_SECONDS = 5;
 
 	/**
-	 * @param array{HttpClientService: IClientService, manager: ExternalShareManager, cloudId: ICloudId, mountpoint: string, token: string, access_token: ?string, access_token_expires: ?int}|array $options
+	 * @param array{HttpClientService: IClientService, manager: ExternalShareManager, cloudId: ICloudId, mountpoint: string, token: string, access_token: ?string, access_token_expires: ?int, token_exchange_mode: ?string, share_id: ?string}|array $options
 	 */
 	public function __construct($options) {
 		$this->memcacheFactory = Server::get(ICacheFactory::class);
@@ -77,36 +80,28 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 		$this->config = Server::get(IConfig::class);
 		$this->appConfig = Server::get(IAppConfig::class);
 		$this->shareManager = Server::get(IShareManager::class);
+		$this->resolver = $this->createResolver();
+		$this->exchangeHelper = $this->createExchangeHelper();
 
-		// Default to basic auth unless we can prove this share is on the
-		// exchange-token path. That keeps pre-upgrade legacy shares from being
-		// pushed onto bearer auth just because the sender now advertises it.
-		$hasStoredAccessToken = !empty($options['access_token']);
-		$shareTokenSupportsExchange = $this->shareTokenSupportsExchange($options['token'] ?? null);
-		$discoverySupportsExchangeToken = false;
+		$this->legacyPassword = (string)($options['password'] ?? '');
+		$this->tokenExchangeMode = $options['token_exchange_mode'] ?? null;
+		$this->shareId = (string)($options['share_id'] ?? '');
+
 		try {
 			$ocmProvider = $discoveryService->discover($this->cloudId->getRemote());
 			$webDavEndpoint = $ocmProvider->extractProtocolEntry('file', 'webdav');
 			$remote = $ocmProvider->getEndPoint();
-			$authType = \Sabre\DAV\Client::AUTH_BASIC;
-			$discoverySupportsExchangeToken = in_array('exchange-token', $ocmProvider->getCapabilities(), true);
 		} catch (OCMProviderException|OCMArgumentException $e) {
 			$this->logger->notice('exception while retrieving webdav endpoint', ['exception' => $e]);
 			$webDavEndpoint = '/public.php/webdav';
 			$remote = $this->cloudId->getRemote();
-			$authType = \Sabre\DAV\Client::AUTH_BASIC;
 		}
 
-		// Sender discovery alone is not enough here. Legacy outgoing shares used
-		// short tokens that were intentionally left outside the sender's token
-		// provider, so they can never complete the bearer exchange after upgrade.
-		//
-		// New code-flow shares use provider-backed tokens. Those tokens are long
-		// enough to identify the exchange-token path even before the receiver has
-		// stored its first access token, so they should still use bearer auth.
-		if ($hasStoredAccessToken || ($discoverySupportsExchangeToken && $shareTokenSupportsExchange)) {
-			$authType = \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER;
-		}
+		$authType = match ($this->tokenExchangeMode) {
+			TokenExchangeMode::EXCHANGE_REQUIRED,
+			TokenExchangeMode::EXCHANGE_OPTIONAL => BearerAuthAwareSabreClient::AUTH_BEARER,
+			default => \Sabre\DAV\Client::AUTH_BASIC,
+		};
 
 		$host = parse_url($remote, PHP_URL_HOST)
 			?? parse_url($this->cloudId->getRemote(), PHP_URL_HOST)
@@ -120,7 +115,6 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 			?? parse_url($this->cloudId->getRemote(), PHP_URL_SCHEME)
 			?? 'https';
 
-		// in case remote NC is on a sub folder and using deprecated ocm provider
 		$tmpPath = rtrim(parse_url($this->cloudId->getRemote(), PHP_URL_PATH) ?? '', '/');
 		if (!str_starts_with($webDavEndpoint, $tmpPath)) {
 			$webDavEndpoint = $tmpPath . $webDavEndpoint;
@@ -138,110 +132,201 @@ class Storage extends DAV implements ISharedStorage, IDisableEncryptionStorage, 
 				'root' => $webDavEndpoint,
 				'user' => $options['token'],
 				'authType' => $authType,
-				'password' => $authType === \OC\Files\Storage\BearerAuthAwareSabreClient::AUTH_BEARER
+				'password' => $authType === BearerAuthAwareSabreClient::AUTH_BEARER
 					? (string)($options['access_token'] ?? '')
-					: (string)($options['password'] ?? ''),
+					: $this->legacyPassword,
 				'discoveryService' => $discoveryService,
 			]
 		);
 	}
 
+	protected function createResolver(): TokenExchangeModeResolver {
+		return Server::get(TokenExchangeModeResolver::class);
+	}
+
+	protected function createExchangeHelper(): TokenExchangeHelper {
+		return Server::get(TokenExchangeHelper::class);
+	}
+
+	protected function init(): void {
+		if ($this->ready) {
+			return;
+		}
+
+		if ($this->resolvingMode) {
+			parent::init();
+			return;
+		}
+
+		// NULL resolution: load the persisted row and resolve mode lazily.
+		if ($this->shareId !== '' && $this->tokenExchangeMode === null) {
+			$share = $this->manager->getShareByIdInternal($this->shareId);
+			if ($share === false) {
+				throw new StorageNotAvailableException('Mounted share row no longer exists');
+			}
+
+			$this->resolvingMode = true;
+			try {
+				$result = $this->resolver->ensureModeResolved($share);
+			} finally {
+				$this->resolvingMode = false;
+			}
+
+			if ($result->resolvedMode !== null) {
+				$this->tokenExchangeMode = $result->resolvedMode;
+			}
+
+			if ($result->resolvedMode === TokenExchangeMode::LEGACY) {
+				$this->authType = \Sabre\DAV\Client::AUTH_BASIC;
+				$this->password = $this->legacyPassword;
+				$this->tokenExpiresAt = 0;
+			} elseif ($result->resolvedMode === TokenExchangeMode::EXCHANGE_OPTIONAL
+				&& $result->accessToken !== null && $result->accessToken !== '') {
+				$this->authType = BearerAuthAwareSabreClient::AUTH_BEARER;
+				$this->password = $result->accessToken;
+				$this->tokenExpiresAt = $result->accessTokenExpires ?? 0;
+			} else {
+				// Unresolved or exchange-optional without bearer: safe basic default.
+				$this->authType = \Sabre\DAV\Client::AUTH_BASIC;
+				$this->password = $this->legacyPassword;
+				$this->tokenExpiresAt = 0;
+			}
+		}
+
+		// Opportunistic exchange for exchange-optional with no stored bearer.
+		if ($this->tokenExchangeMode === TokenExchangeMode::EXCHANGE_OPTIONAL
+			&& empty($this->password)) {
+			$exchangeResult = $this->exchangeHelper->exchange(
+				$this->cloudId->getRemote(),
+				$this->token,
+			);
+			if ($exchangeResult->outcome === ExchangeOutcome::Success) {
+				$this->authType = BearerAuthAwareSabreClient::AUTH_BEARER;
+				$this->password = $exchangeResult->accessToken;
+				$this->tokenExpiresAt = $exchangeResult->accessTokenExpires ?? 0;
+				$this->manager->updateAccessToken(
+					$this->token,
+					$exchangeResult->accessToken,
+					$exchangeResult->accessTokenExpires ?? 0,
+				);
+			} else {
+				$this->authType = \Sabre\DAV\Client::AUTH_BASIC;
+				$this->password = $this->legacyPassword;
+			}
+		}
+
+		// Bearer-empty guard: prevents parent::init() from entering its own
+		// exchangeRefreshToken() path, which this class no longer uses.
+		if ($this->authType === BearerAuthAwareSabreClient::AUTH_BEARER
+			&& empty($this->password)) {
+			throw new StorageNotAvailableException(
+				'Bearer auth selected but no access token available'
+			);
+		}
+
+		parent::init();
+	}
+
 	/**
-	 * Refresh the bearer token. Extends parent to also persist to database.
-	 *
-	 * Uses expiry timestamps instead of a boolean flag so that concurrent
-	 * processes can detect that another process already obtained a fresh token
-	 * and reuse it rather than performing a redundant exchange.
-	 *
-	 * After a failed exchange, a 5-second backoff is applied so that
-	 * subsequent file operations do not hammer the remote token endpoint.
-	 * The DB is still consulted during backoff in case a concurrent process
-	 * succeeded; only the outgoing exchange call is suppressed.
-	 *
-	 * @return bool True if token was refreshed (or reused from DB) successfully
+	 * Reset DAV client state so the immediate retry closure sees fresh auth.
+	 * Every refreshBearerToken() branch that returns true must call this.
 	 */
+	private function reinitializeAuthForRetry(): void {
+		$this->ready = false;
+		$this->client = null;
+		$this->bearerToken = null;
+		parent::init();
+	}
+
 	protected function refreshBearerToken(): bool {
 		$now = time();
 
-		// In the common case, a locally unexpired bearer means this process does
-		// not need to exchange again. A real remote 401 overrides that shortcut.
 		if (!$this->forceTokenRefresh && $this->tokenExpiresAt > $now) {
 			return false;
 		}
 
-		// Another process may have refreshed first, so look for newer bearer
-		// state in the database before making our own exchange call.
+		// Concurrent-refresh check: reuse a fresher DB token if available.
 		$share = $this->manager->getShareByToken($this->token);
 		if ($share !== false) {
 			$dbExpiry = $share->getAccessTokenExpires();
 			$dbToken = $share->getAccessToken();
 			if ($dbExpiry !== null && $dbExpiry > $now && $dbToken !== null && $dbToken !== $this->password) {
-				// Reuse a fresh DB token, but never "refresh" into the same stale
-				// bearer value that already triggered the 401 in this process.
 				$this->password = $dbToken;
 				$this->tokenExpiresAt = $dbExpiry;
-				$this->refreshFailureCount = 0;
 				$this->refreshBackoffUntil = 0;
-				$this->ready = false;
-				$this->client = null;
-				$this->init();
+				$this->reinitializeAuthForRetry();
 				$this->logger->debug('Reused access token refreshed by another process', ['app' => 'files_sharing']);
 				return true;
 			}
 		}
 
-		// After enough failures, stop exchanging again for the lifetime of this instance.
-		if ($this->refreshFailureCount >= self::REFRESH_MAX_ATTEMPTS) {
-			return false;
-		}
-
-		// Respect the short backoff window between failed exchange attempts.
+		// Mode-aware backoff window.
 		if ($this->refreshBackoffUntil > $now) {
-			return false;
-		}
-
-		// No reusable bearer was found, so this process has to exchange the
-		// refresh token itself.
-		try {
-			$tokenResponse = $this->exchangeRefreshTokenResponse();
-			$expiresIn = $tokenResponse['expiresIn'] ?? null;
-			// Fall back to the legacy 1-hour window only when the remote omits expiry metadata.
-			$expiresAt = $now + (($expiresIn !== null && $expiresIn > 0) ? $expiresIn : 3600);
-			$newAccessToken = $tokenResponse['accessToken'] ?? null;
-			if (!is_string($newAccessToken) || $newAccessToken === '') {
-				throw new StorageNotAvailableException('Could not obtain access token: missing accessToken field');
+			if ($this->tokenExchangeMode === TokenExchangeMode::EXCHANGE_REQUIRED) {
+				throw new StorageNotAvailableException(
+					'exchange-required share in backoff window after transient failure'
+				);
 			}
-			$this->password = $newAccessToken;
-			$this->tokenExpiresAt = $expiresAt;
-			$this->refreshFailureCount = 0;
-			$this->refreshBackoffUntil = 0;
-
-			$this->manager->updateAccessToken($this->token, $newAccessToken, $expiresAt);
-
-			$this->ready = false;
-			$this->client = null;
-			$this->init();
-
-			$this->logger->debug('Successfully refreshed access token', ['app' => 'files_sharing']);
+			$this->authType = \Sabre\DAV\Client::AUTH_BASIC;
+			$this->password = $this->legacyPassword;
+			$this->reinitializeAuthForRetry();
 			return true;
-		} catch (\Exception $e) {
-			$this->refreshFailureCount++;
-			$this->refreshBackoffUntil = $now + self::REFRESH_BACKOFF_SECONDS;
-			$this->logger->warning('Failed to refresh access token (attempt {attempt}/{max})', [
-				'app' => 'files_sharing',
-				'attempt' => $this->refreshFailureCount,
-				'max' => self::REFRESH_MAX_ATTEMPTS,
-				'exception' => $e,
-			]);
-			return false;
 		}
-	}
 
-	private function shareTokenSupportsExchange(?string $shareToken): bool {
-		// Branch-local heuristic: provider-backed share codes created by this
-		// code-flow branch satisfy TOKEN_MIN_LENGTH. Preserved legacy share
-		// secrets are shorter and must stay on the basic-auth path.
-		return $shareToken !== null && strlen($shareToken) >= PublicKeyTokenProvider::TOKEN_MIN_LENGTH;
+		$result = $this->exchangeHelper->exchange(
+			$this->cloudId->getRemote(),
+			$this->token,
+		);
+
+		// exchange-required: any non-success is fatal, no fallback.
+		if ($this->tokenExchangeMode === TokenExchangeMode::EXCHANGE_REQUIRED) {
+			if ($result->outcome !== ExchangeOutcome::Success) {
+				throw new StorageNotAvailableException(
+					'exchange-required share: token exchange failed (' . $result->outcome->value . ')'
+				);
+			}
+			$this->password = $result->accessToken;
+			$this->tokenExpiresAt = $result->accessTokenExpires ?? 0;
+			$this->refreshBackoffUntil = 0;
+			$this->manager->updateAccessToken($this->token, $result->accessToken, $result->accessTokenExpires ?? 0);
+			$this->reinitializeAuthForRetry();
+			$this->logger->debug('Refreshed bearer token for exchange-required share', ['app' => 'files_sharing']);
+			return true;
+		}
+
+		// exchange-optional (and legacy/NULL if they somehow reach here).
+		if ($result->outcome === ExchangeOutcome::Success) {
+			$this->password = $result->accessToken;
+			$this->tokenExpiresAt = $result->accessTokenExpires ?? 0;
+			$this->refreshBackoffUntil = 0;
+			$this->manager->updateAccessToken($this->token, $result->accessToken, $result->accessTokenExpires ?? 0);
+			$this->reinitializeAuthForRetry();
+			$this->logger->debug('Refreshed bearer token', ['app' => 'files_sharing']);
+			return true;
+		}
+
+		if ($result->outcome === ExchangeOutcome::DefinitiveInvalidGrant
+			|| $result->outcome === ExchangeOutcome::DefinitiveNoCapability) {
+			$this->manager->updateModeAndClearBearer($this->token, TokenExchangeMode::LEGACY);
+			$this->tokenExchangeMode = TokenExchangeMode::LEGACY;
+			$this->authType = \Sabre\DAV\Client::AUTH_BASIC;
+			$this->password = $this->legacyPassword;
+			$this->tokenExpiresAt = 0;
+			$this->reinitializeAuthForRetry();
+			$this->logger->info('Downgraded to legacy after ' . $result->outcome->value, ['app' => 'files_sharing']);
+			return true;
+		}
+
+		// Non-definitive outcomes: request-local basic fallback, no DB write.
+		if ($result->outcome === ExchangeOutcome::TransientFailure
+			|| $result->outcome === ExchangeOutcome::MalformedResponse) {
+			$this->refreshBackoffUntil = $now + self::REFRESH_BACKOFF_SECONDS;
+		}
+		$this->authType = \Sabre\DAV\Client::AUTH_BASIC;
+		$this->password = $this->legacyPassword;
+		$this->reinitializeAuthForRetry();
+		$this->logger->warning('Request-local basic fallback after ' . $result->outcome->value, ['app' => 'files_sharing']);
+		return true;
 	}
 
 	public function getWatcher(string $path = '', ?IStorage $storage = null): IWatcher {
