@@ -210,9 +210,7 @@ class CloudFederationProviderFilesTest extends TestCase {
 		];
 	}
 
-	/**
-	 * @dataProvider mustExchangeTokenRejectionProvider
-	 */
+	#[\PHPUnit\Framework\Attributes\DataProvider(methodName: 'mustExchangeTokenRejectionProvider')]
 	public function testShareReceivedMustExchangeTokenThrowsOnAllNonSuccessOutcomes(ExchangeOutcome $outcome): void {
 		$this->enableS2S();
 

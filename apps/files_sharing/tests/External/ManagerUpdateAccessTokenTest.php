@@ -11,6 +11,7 @@ namespace OCA\Files_Sharing\Tests\External;
 use OCA\Files_Sharing\External\ExternalShare;
 use OCA\Files_Sharing\External\ExternalShareMapper;
 use OCA\Files_Sharing\External\Manager;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
 use OCP\DB\Exception;
 use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Federation\ICloudFederationFactory;
@@ -141,6 +142,131 @@ class ManagerUpdateAccessTokenTest extends TestCase {
 		$this->assertSame(9999, $updatedParent->getAccessTokenExpires());
 		$this->assertSame('fanout-access-token', $updatedSubShare->getAccessToken());
 		$this->assertSame(9999, $updatedSubShare->getAccessTokenExpires());
+	}
+
+	#[\PHPUnit\Framework\Attributes\Group(name: 'DB')]
+	public function testUpdateModeByShareTokenFansOutAcrossRows(): void {
+		$this->usesDatabase = true;
+		$realMapper = new ExternalShareMapper(
+			Server::get(IDBConnection::class),
+			$this->createMock(IGroupManager::class),
+		);
+
+		$parentShare = $this->createGroupShareRow('group1', 'fan-token', '{{TemporaryMountPointName#/SharedFolder}}');
+		$parentShare->setAccessToken('existing-bearer');
+		$parentShare->setAccessTokenExpires(9999);
+		$realMapper->insert($parentShare);
+
+		$subShare = $this->createGroupShareRow('user1', 'fan-token', '/SharedFolder', (string)$parentShare->getId(), IShare::STATUS_ACCEPTED);
+		$subShare->setAccessToken('existing-bearer');
+		$subShare->setAccessTokenExpires(9999);
+		$realMapper->insert($subShare);
+
+		$realMapper->updateModeByShareToken('fan-token', TokenExchangeMode::LEGACY);
+
+		$updatedParent = $realMapper->getById((string)$parentShare->getId());
+		$updatedSub = $realMapper->getById((string)$subShare->getId());
+
+		$this->assertSame(TokenExchangeMode::LEGACY, $updatedParent->getTokenExchangeMode());
+		$this->assertSame(TokenExchangeMode::LEGACY, $updatedSub->getTokenExchangeMode());
+		$this->assertSame('existing-bearer', $updatedParent->getAccessToken());
+		$this->assertSame(9999, $updatedParent->getAccessTokenExpires());
+		$this->assertSame('existing-bearer', $updatedSub->getAccessToken());
+		$this->assertSame(9999, $updatedSub->getAccessTokenExpires());
+	}
+
+	#[\PHPUnit\Framework\Attributes\Group(name: 'DB')]
+	public function testUpdateModeAndClearBearerByShareTokenFansOutAndZeroesBearer(): void {
+		$this->usesDatabase = true;
+		$realMapper = new ExternalShareMapper(
+			Server::get(IDBConnection::class),
+			$this->createMock(IGroupManager::class),
+		);
+
+		$parentShare = $this->createGroupShareRow('group1', 'clear-token', '{{TemporaryMountPointName#/SharedFolder}}');
+		$parentShare->setAccessToken('stale-bearer');
+		$parentShare->setAccessTokenExpires(9999);
+		$realMapper->insert($parentShare);
+
+		$subShare = $this->createGroupShareRow('user1', 'clear-token', '/SharedFolder', (string)$parentShare->getId(), IShare::STATUS_ACCEPTED);
+		$subShare->setAccessToken('stale-bearer');
+		$subShare->setAccessTokenExpires(9999);
+		$realMapper->insert($subShare);
+
+		$realMapper->updateModeAndClearBearerByShareToken('clear-token', TokenExchangeMode::LEGACY);
+
+		$updatedParent = $realMapper->getById((string)$parentShare->getId());
+		$updatedSub = $realMapper->getById((string)$subShare->getId());
+
+		$this->assertSame(TokenExchangeMode::LEGACY, $updatedParent->getTokenExchangeMode());
+		$this->assertSame(TokenExchangeMode::LEGACY, $updatedSub->getTokenExchangeMode());
+		$this->assertNull($updatedParent->getAccessToken());
+		$this->assertNull($updatedParent->getAccessTokenExpires());
+		$this->assertNull($updatedSub->getAccessToken());
+		$this->assertNull($updatedSub->getAccessTokenExpires());
+	}
+
+	#[\PHPUnit\Framework\Attributes\Group(name: 'DB')]
+	public function testUpdateModeAndAccessTokenByShareTokenFansOutAtomically(): void {
+		$this->usesDatabase = true;
+		$realMapper = new ExternalShareMapper(
+			Server::get(IDBConnection::class),
+			$this->createMock(IGroupManager::class),
+		);
+
+		$parentShare = $this->createGroupShareRow('group1', 'atomic-token', '{{TemporaryMountPointName#/SharedFolder}}');
+		$realMapper->insert($parentShare);
+
+		$subShare = $this->createGroupShareRow('user1', 'atomic-token', '/SharedFolder', (string)$parentShare->getId(), IShare::STATUS_ACCEPTED);
+		$realMapper->insert($subShare);
+
+		$realMapper->updateModeAndAccessTokenByShareToken(
+			'atomic-token',
+			TokenExchangeMode::EXCHANGE_OPTIONAL,
+			'new-bearer',
+			7777,
+		);
+
+		$updatedParent = $realMapper->getById((string)$parentShare->getId());
+		$updatedSub = $realMapper->getById((string)$subShare->getId());
+
+		$this->assertSame(TokenExchangeMode::EXCHANGE_OPTIONAL, $updatedParent->getTokenExchangeMode());
+		$this->assertSame(TokenExchangeMode::EXCHANGE_OPTIONAL, $updatedSub->getTokenExchangeMode());
+		$this->assertSame('new-bearer', $updatedParent->getAccessToken());
+		$this->assertSame(7777, $updatedParent->getAccessTokenExpires());
+		$this->assertSame('new-bearer', $updatedSub->getAccessToken());
+		$this->assertSame(7777, $updatedSub->getAccessTokenExpires());
+	}
+
+	public function testUpdateModeAndClearBearerDelegatesToMapper(): void {
+		$this->externalShareMapper->expects($this->once())
+			->method('updateModeAndClearBearerByShareToken')
+			->with('tok', TokenExchangeMode::LEGACY)
+			->willReturn(1);
+
+		$this->manager->updateModeAndClearBearer('tok', TokenExchangeMode::LEGACY);
+	}
+
+	public function testUpdateModeAndClearBearerLogsWarningOnZeroRows(): void {
+		$this->externalShareMapper->method('updateModeAndClearBearerByShareToken')
+			->willReturn(0);
+
+		$this->logger->expects($this->once())
+			->method('warning')
+			->with($this->stringContains('Could not find share'));
+
+		$this->manager->updateModeAndClearBearer('missing-tok', TokenExchangeMode::LEGACY);
+	}
+
+	public function testUpdateModeAndClearBearerSwallowsDbException(): void {
+		$this->externalShareMapper->method('updateModeAndClearBearerByShareToken')
+			->willThrowException(new Exception('db error'));
+
+		$this->logger->expects($this->once())
+			->method('error')
+			->with($this->stringContains('Failed to update'));
+
+		$this->manager->updateModeAndClearBearer('tok', TokenExchangeMode::LEGACY);
 	}
 
 	private function createGroupShareRow(
