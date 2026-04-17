@@ -32,6 +32,15 @@ class LocalOCMDiscoveryEvent extends Event {
 	}
 
 	/**
+	 * Returns the OCM provider being assembled for local discovery.
+	 *
+	 * @since 34.0.0
+	 */
+	public function getProvider(): IOCMProvider {
+		return $this->provider;
+	}
+
+	/**
 	 * Add a new OCM capability to the discovery data of local instance
 	 *
 	 * @since 33.0.0
