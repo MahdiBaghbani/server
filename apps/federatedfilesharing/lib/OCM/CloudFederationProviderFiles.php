@@ -8,7 +8,6 @@ namespace OCA\FederatedFileSharing\OCM;
 
 use OC\AppFramework\Http;
 use OC\Files\Filesystem;
-use OC\OCM\OCMSignatoryManager;
 use OCA\FederatedFileSharing\AddressHandler;
 use OCA\FederatedFileSharing\FederatedShareProvider;
 use OCA\Federation\TrustedServers;
@@ -16,6 +15,9 @@ use OCA\Files_Sharing\Activity\Providers\RemoteShares;
 use OCA\Files_Sharing\External\ExternalShare;
 use OCA\Files_Sharing\External\ExternalShareMapper;
 use OCA\Files_Sharing\External\Manager;
+use OCA\Files_Sharing\Service\ExchangeOutcome;
+use OCA\Files_Sharing\Service\TokenExchangeHelper;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
 use OCA\GlobalSiteSelector\Service\SlaveService;
 use OCA\Polls\Db\Share;
 use OCP\Activity\IManager as IActivityManager;
@@ -34,7 +36,6 @@ use OCP\Files\IFilenameValidator;
 use OCP\Files\ISetupManager;
 use OCP\Files\NotFoundException;
 use OCP\HintException;
-use OCP\Http\Client\IClientService;
 use OCP\IAppConfig;
 use OCP\IConfig;
 use OCP\IGroupManager;
@@ -42,8 +43,6 @@ use OCP\IURLGenerator;
 use OCP\IUser;
 use OCP\IUserManager;
 use OCP\Notification\IManager as INotificationManager;
-use OCP\OCM\IOCMDiscoveryService;
-use OCP\Security\Signature\ISignatureManager;
 use OCP\Server;
 use OCP\Share\Exceptions\ShareNotFound;
 use OCP\Share\IManager;
@@ -75,10 +74,6 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 		private readonly IProviderFactory $shareProviderFactory,
 		private readonly ISetupManager $setupManager,
 		private readonly ExternalShareMapper $externalShareMapper,
-		private readonly IOCMDiscoveryService $discoveryService,
-		private readonly IClientService $clientService,
-		private readonly ISignatureManager $signatureManager,
-		private readonly OCMSignatoryManager $signatoryManager,
 		private readonly IAppConfig $appConfig,
 	) {
 	}
@@ -121,33 +116,38 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 		$mustExchangeToken = in_array('must-exchange-token', $requirements);
 		$accessToken = null;
 		$accessTokenExpires = null;
+		$tokenExchangeMode = null;
+
+		/** @var TokenExchangeHelper $exchangeHelper */
+		$exchangeHelper = Server::get(TokenExchangeHelper::class);
 
 		if ($mustExchangeToken) {
-			// must-exchange-token is part of the sender contract, so reject the
-			// share if we cannot turn the shared secret into bearer credentials.
-			$tokenExchange = $this->exchangeToken($remote, $token);
-			if ($tokenExchange === null) {
+			$result = $exchangeHelper->exchange($remote, $token);
+			if ($result->outcome !== ExchangeOutcome::Success) {
 				throw new ProviderCouldNotAddShareException('Failed to exchange token as required by must-exchange-token', '', Http::STATUS_BAD_REQUEST);
 			}
-			$accessToken = $tokenExchange['accessToken'];
-			$accessTokenExpires = $tokenExchange['expiresAt'];
+			$tokenExchangeMode = TokenExchangeMode::EXCHANGE_REQUIRED;
+			$accessToken = $result->accessToken;
+			$accessTokenExpires = $result->accessTokenExpires;
 		} else {
-			// exchange-token capability is only an optimization here. If the
-			// optional exchange fails, keep accepting the share without token data.
-			try {
-				$ocmProvider = $this->discoveryService->discover(rtrim($remote, '/'));
-				$capabilities = $ocmProvider->getCapabilities();
-				if (in_array('exchange-token', $capabilities)) {
-					$tokenExchange = $this->exchangeToken($remote, $token);
-					if ($tokenExchange !== null) {
-						$accessToken = $tokenExchange['accessToken'] ?? null;
-						$accessTokenExpires = $tokenExchange['expiresAt'] ?? null;
-					}
-					$this->logger->debug('Exchanged token for remote with exchange-token capability', ['remote' => $remote, 'success' => $accessToken !== null]);
-				}
-			} catch (\Exception $e) {
-				$this->logger->debug('Could not discover remote capabilities for token exchange', ['remote' => $remote, 'exception' => $e]);
+			$result = $exchangeHelper->exchange($remote, $token);
+			$tokenExchangeMode = match ($result->outcome) {
+				ExchangeOutcome::Success => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				ExchangeOutcome::DefinitiveNoCapability => TokenExchangeMode::LEGACY,
+				ExchangeOutcome::DefinitiveInvalidGrant => TokenExchangeMode::LEGACY,
+				ExchangeOutcome::ExplicitInvalidRequest,
+				ExchangeOutcome::MalformedResponse,
+				ExchangeOutcome::TransientFailure => TokenExchangeMode::EXCHANGE_OPTIONAL,
+			};
+			if ($result->outcome === ExchangeOutcome::Success) {
+				$accessToken = $result->accessToken;
+				$accessTokenExpires = $result->accessTokenExpires;
 			}
+			$this->logger->debug('Optional token exchange attempted', [
+				'remote' => $remote,
+				'outcome' => $result->outcome->value,
+				'resolvedMode' => $tokenExchangeMode,
+			]);
 		}
 
 		// if no explicit information about the person who created the share was sent
@@ -200,6 +200,7 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 			$externalShare->setName($name);
 			$externalShare->setOwner($owner);
 			$externalShare->setShareType($shareType);
+			$externalShare->setTokenExchangeMode($tokenExchangeMode);
 			$externalShare->setAccepted(IShare::STATUS_PENDING);
 
 			try {
@@ -734,107 +735,4 @@ class CloudFederationProviderFiles implements ISignedCloudFederationProvider {
 		}
 	}
 
-	/**
-	 * Exchange a sharedSecret (refresh token) for an access token via the remote server's token endpoint.
-	 *
-	 * @return array{accessToken: string, expiresAt: ?int}|null
-	 */
-	private function exchangeToken(string $remote, #[SensitiveParameter] string $sharedSecret): ?array {
-		try {
-			$ocmProvider = $this->discoveryService->discover(rtrim($remote, '/'));
-			$tokenEndpoint = $ocmProvider->getTokenEndPoint();
-
-			if ($tokenEndpoint === '') {
-				$this->logger->warning('Remote server does not expose tokenEndPoint', ['remote' => $remote]);
-				return null;
-			}
-
-			$client = $this->clientService->newClient();
-			$clientId = parse_url($this->urlGenerator->getAbsoluteURL('/'), PHP_URL_HOST);
-
-			$payload = [
-				'grant_type' => 'authorization_code',
-				'client_id' => $clientId,
-				'code' => $sharedSecret,
-			];
-
-			$options = [
-				'body' => http_build_query($payload),
-				'headers' => [
-					'Content-Type' => 'application/x-www-form-urlencoded',
-				],
-				'timeout' => 10,
-				'connect_timeout' => 10,
-			];
-
-			try {
-				$options = $this->signatureManager->signOutgoingRequestIClientPayload(
-					$this->signatoryManager,
-					$options,
-					'post',
-					$tokenEndpoint
-				);
-				$this->logger->debug('Token request signed successfully', ['remote' => $remote]);
-			} catch (\Exception $e) {
-				$this->logger->error('Failed to sign token request', [
-					'remote' => $remote,
-					'exception' => $e,
-					'endpoint' => $tokenEndpoint,
-				]);
-				return null;
-			}
-
-			$response = $client->post($tokenEndpoint, $options);
-
-			$statusCode = $response->getStatusCode();
-			if ($statusCode !== 200) {
-				$this->logger->warning('Token exchange returned unexpected HTTP status', [
-					'remote' => $remote,
-					'status' => $statusCode,
-				]);
-				return null;
-			}
-
-			$data = json_decode($response->getBody(), true);
-
-			if (!is_array($data)) {
-				$this->logger->warning('Token exchange response is not valid JSON', ['remote' => $remote]);
-				return null;
-			}
-
-			$accessToken = $data['access_token'] ?? null;
-			$tokenType = $data['token_type'] ?? null;
-			$expiresIn = $data['expires_in'] ?? null;
-
-			if (!is_string($accessToken) || $accessToken === '') {
-				$this->logger->warning('Token exchange response missing or invalid access_token', ['remote' => $remote]);
-				return null;
-			}
-
-			if (!is_string($tokenType) || strtolower($tokenType) !== 'bearer') {
-				$this->logger->warning('Token exchange response has unexpected token_type', [
-					'remote' => $remote,
-					'token_type' => $tokenType,
-				]);
-				return null;
-			}
-
-			$expiresAt = null;
-			if (is_numeric($expiresIn) && (int)$expiresIn > 0) {
-				$expiresAt = time() + (int)$expiresIn;
-			}
-
-			$this->logger->debug('Successfully exchanged token for access token', [
-				'remote' => $remote,
-				'has_expiry' => $expiresAt !== null,
-			]);
-			return [
-				'accessToken' => $accessToken,
-				'expiresAt' => $expiresAt,
-			];
-		} catch (\Exception $e) {
-			$this->logger->warning('Failed to exchange token', ['remote' => $remote, 'exception' => $e]);
-			return null;
-		}
-	}
 }

@@ -16,7 +16,9 @@ use OCA\Files_Sharing\External\ExternalShare;
 use OCA\Files_Sharing\External\ExternalShareMapper;
 use OCA\Files_Sharing\External\Manager;
 use OCA\Files_Sharing\External\MountProvider;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
 use OCA\Files_Sharing\Tests\TestCase;
+use OCP\Files\Events\InvalidateMountCacheEvent;
 use OCP\Contacts\IManager;
 use OCP\EventDispatcher\IEventDispatcher;
 use OCP\Federation\ICloudFederationFactory;
@@ -564,6 +566,7 @@ class ManagerTest extends TestCase {
 		$share->setMountpoint('/SharedFolder');
 		$share->setAccessToken('stored-access-token');
 		$share->setAccessTokenExpires(time() + 3600);
+		$share->setTokenExchangeMode(TokenExchangeMode::EXCHANGE_OPTIONAL);
 		$this->externalShareMapper->update($share);
 
 		$this->setupMounts();
@@ -765,6 +768,52 @@ class ManagerTest extends TestCase {
 		$this->assertCount(1, $user2Shares);
 		$this->assertEquals($user2Shares[0]->getShareType(), IShare::TYPE_USER);
 		$this->assertEquals($user2Shares[0]->getUser(), 'user2');
+	}
+
+	public function testAcceptGroupShareCopiesTokenExchangeModeToSubShare(): void {
+		[$shareData, $groupShare] = $this->createTestGroupShare();
+
+		$groupShare->setTokenExchangeMode(TokenExchangeMode::EXCHANGE_OPTIONAL);
+		$this->externalShareMapper->update($groupShare);
+
+		$this->assertTrue($this->manager->acceptShare($groupShare));
+
+		$acceptedShares = $this->externalShareMapper->getShares($this->user, IShare::STATUS_ACCEPTED);
+		$this->assertCount(1, $acceptedShares);
+		$this->assertSame(
+			TokenExchangeMode::EXCHANGE_OPTIONAL,
+			$acceptedShares[0]->getTokenExchangeMode(),
+		);
+	}
+
+	public function testAcceptGroupShareDispatchesInvalidateMountCacheEvent(): void {
+		[$shareData, $groupShare] = $this->createTestGroupShare();
+
+		$dispatched = false;
+		$this->eventDispatcher->method('dispatchTyped')
+			->willReturnCallback(function ($event) use (&$dispatched): void {
+				if ($event instanceof InvalidateMountCacheEvent) {
+					$dispatched = true;
+				}
+			});
+
+		$this->assertTrue($this->manager->acceptShare($groupShare));
+		$this->assertTrue($dispatched, 'InvalidateMountCacheEvent must be dispatched on group accept');
+	}
+
+	public function testDeclineGroupShareDispatchesInvalidateMountCacheEvent(): void {
+		[$shareData, $groupShare] = $this->createTestGroupShare();
+
+		$dispatched = false;
+		$this->eventDispatcher->method('dispatchTyped')
+			->willReturnCallback(function ($event) use (&$dispatched): void {
+				if ($event instanceof InvalidateMountCacheEvent) {
+					$dispatched = true;
+				}
+			});
+
+		$this->assertTrue($this->manager->declineShare($groupShare));
+		$this->assertTrue($dispatched, 'InvalidateMountCacheEvent must be dispatched on group decline');
 	}
 
 	protected function assertExternalShareEntry(ExternalShare $expected, ExternalShare $actual, int $share, string $mountPoint, IUser|IGroup $targetEntity): void {

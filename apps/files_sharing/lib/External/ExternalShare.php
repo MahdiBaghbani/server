@@ -44,6 +44,8 @@ use OCP\Share\IShare;
  * @method void setMountpointHash(string $mountPointHash)
  * @method int getAccepted()
  * @method void setAccepted(int $accepted)
+ * @method string|null getTokenExchangeMode()
+ * @method void setTokenExchangeMode(?string $tokenExchangeMode)
  *
  * @psalm-import-type Files_SharingRemoteShare from ResponseDefinitions
  */
@@ -62,6 +64,7 @@ class ExternalShare extends SnowflakeAwareEntity implements \JsonSerializable {
 	protected ?string $mountpoint = null;
 	protected ?string $mountpointHash = null;
 	protected ?int $accepted = null;
+	protected ?string $tokenExchangeMode = null;
 
 	public function __construct() {
 		$this->addType('id', Types::STRING); // Stored as a bigint
@@ -79,6 +82,7 @@ class ExternalShare extends SnowflakeAwareEntity implements \JsonSerializable {
 		$this->addType('mountpoint', Types::STRING);
 		$this->addType('mountpointHash', Types::STRING);
 		$this->addType('accepted', Types::INTEGER);
+		$this->addType('tokenExchangeMode', Types::STRING);
 	}
 
 	public function setMountpoint(string $mountPoint): void {
@@ -141,6 +145,7 @@ class ExternalShare extends SnowflakeAwareEntity implements \JsonSerializable {
 		$newShare->setOwner($this->getOwner());
 		$newShare->setMountpoint($this->getMountpoint());
 		$newShare->setAccepted($this->getAccepted());
+		$newShare->setTokenExchangeMode($this->getTokenExchangeMode());
 		return $newShare;
 	}
 }

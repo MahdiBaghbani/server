@@ -59,7 +59,7 @@ class MountProvider implements IMountProvider, IPartialMountProvider {
 
 	public function getMountsForUser(IUser $user, IStorageFactory $loader): array {
 		$qb = $this->connection->getQueryBuilder();
-		$qb->select('id', 'remote', 'share_token', 'password', 'access_token', 'access_token_expires', 'mountpoint', 'owner')
+		$qb->select('id', 'remote', 'share_token', 'password', 'access_token', 'access_token_expires', 'mountpoint', 'owner', 'token_exchange_mode')
 			->from('share_external')
 			->where($qb->expr()->eq('user', $qb->createNamedParameter($user->getUID())))
 			->andWhere($qb->expr()->eq('accepted', $qb->createNamedParameter(IShare::STATUS_ACCEPTED, IQueryBuilder::PARAM_INT)));
@@ -68,6 +68,7 @@ class MountProvider implements IMountProvider, IPartialMountProvider {
 		while ($row = $result->fetchAssociative()) {
 			$row['manager'] = $this;
 			$row['token'] = $row['share_token'];
+			$row['share_id'] = $row['id'];
 			$mounts[] = $this->getMount($user, $row, $loader);
 		}
 		$result->closeCursor();
@@ -99,7 +100,7 @@ class MountProvider implements IMountProvider, IPartialMountProvider {
 		}
 
 		$qb = $this->connection->getQueryBuilder();
-		$qb->select('id', 'remote', 'share_token', 'password', 'access_token', 'access_token_expires', 'mountpoint', 'owner')
+		$qb->select('id', 'remote', 'share_token', 'password', 'access_token', 'access_token_expires', 'mountpoint', 'owner', 'token_exchange_mode')
 			->from('share_external')
 			->where($qb->expr()->eq('user', $qb->createNamedParameter($user->getUID())))
 			->andWhere($qb->expr()->eq('accepted', $qb->createNamedParameter(IShare::STATUS_ACCEPTED, IQueryBuilder::PARAM_INT)));
@@ -116,6 +117,7 @@ class MountProvider implements IMountProvider, IPartialMountProvider {
 		while ($row = $result->fetchAssociative()) {
 			$row['manager'] = $this;
 			$row['token'] = $row['share_token'];
+			$row['share_id'] = $row['id'];
 			$mount = $this->getMount($user, $row, $loader);
 			$mounts[$mount->getMountPoint()] = $mount;
 		}

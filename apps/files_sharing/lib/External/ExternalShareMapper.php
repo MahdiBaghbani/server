@@ -71,6 +71,37 @@ class ExternalShareMapper extends QBMapper {
 		return $qb->executeStatement();
 	}
 
+	public function updateModeByShareToken(string $shareToken, string $mode): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update(self::TABLE_NAME)
+			->set('token_exchange_mode', $qb->createNamedParameter($mode, IQueryBuilder::PARAM_STR))
+			->where($qb->expr()->eq('share_token', $qb->createNamedParameter($shareToken, IQueryBuilder::PARAM_STR)));
+
+		return $qb->executeStatement();
+	}
+
+	public function updateModeAndClearBearerByShareToken(string $shareToken, string $mode): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update(self::TABLE_NAME)
+			->set('token_exchange_mode', $qb->createNamedParameter($mode, IQueryBuilder::PARAM_STR))
+			->set('access_token', $qb->createNamedParameter(null))
+			->set('access_token_expires', $qb->createNamedParameter(null))
+			->where($qb->expr()->eq('share_token', $qb->createNamedParameter($shareToken, IQueryBuilder::PARAM_STR)));
+
+		return $qb->executeStatement();
+	}
+
+	public function updateModeAndAccessTokenByShareToken(string $shareToken, string $mode, string $accessToken, ?int $expiresAt): int {
+		$qb = $this->db->getQueryBuilder();
+		$qb->update(self::TABLE_NAME)
+			->set('token_exchange_mode', $qb->createNamedParameter($mode, IQueryBuilder::PARAM_STR))
+			->set('access_token', $qb->createNamedParameter($accessToken, IQueryBuilder::PARAM_STR))
+			->set('access_token_expires', $qb->createNamedParameter($expiresAt, IQueryBuilder::PARAM_INT))
+			->where($qb->expr()->eq('share_token', $qb->createNamedParameter($shareToken, IQueryBuilder::PARAM_STR)));
+
+		return $qb->executeStatement();
+	}
+
 	/**
 	 * Get share by parent id and user.
 	 *

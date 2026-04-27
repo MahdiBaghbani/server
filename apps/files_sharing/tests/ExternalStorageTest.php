@@ -7,50 +7,70 @@
  */
 namespace OCA\Files_Sharing\Tests;
 
-use GuzzleHttp\Exception\ClientException;
-use GuzzleHttp\Psr7\Request;
-use GuzzleHttp\Psr7\Response as Psr7Response;
 use OC\Federation\CloudId;
+use OCA\Files_Sharing\External\ExternalShare;
 use OCA\Files_Sharing\External\Manager as ExternalShareManager;
 use OCA\Files_Sharing\External\Storage;
+use OCA\Files_Sharing\Service\ExchangeOutcome;
+use OCA\Files_Sharing\Service\ExchangeResult;
+use OCA\Files_Sharing\Service\ResolutionResult;
+use OCA\Files_Sharing\Service\TokenExchangeHelper;
+use OCA\Files_Sharing\Service\TokenExchangeMode;
+use OCA\Files_Sharing\Service\TokenExchangeModeResolver;
+use OCP\Files\StorageNotAvailableException;
 use OCP\Http\Client\IClient;
 use OCP\Http\Client\IClientService;
 use OCP\Http\Client\IResponse;
 use OCP\ICertificateManager;
 use OCP\Server;
+use PHPUnit\Framework\MockObject\MockObject;
 
 /**
  * Tests for the external Storage class for remote shares.
  */
 #[\PHPUnit\Framework\Attributes\Group(name: 'DB')]
 class ExternalStorageTest extends \Test\TestCase {
+	private TokenExchangeModeResolver&MockObject $mockResolver;
+	private TokenExchangeHelper&MockObject $mockExchangeHelper;
+
+	protected function setUp(): void {
+		parent::setUp();
+
+		$this->mockResolver = $this->createMock(TokenExchangeModeResolver::class);
+		$this->mockExchangeHelper = $this->createMock(TokenExchangeHelper::class);
+
+		TestSharingExternalStorage::setTestResolver($this->mockResolver);
+		TestSharingExternalStorage::setTestExchangeHelper($this->mockExchangeHelper);
+	}
+
+	protected function tearDown(): void {
+		TestSharingExternalStorage::setTestResolver(null);
+		TestSharingExternalStorage::setTestExchangeHelper(null);
+		parent::tearDown();
+	}
+
 	public static function optionsProvider(): array {
 		return [
 			[
 				'http://remoteserver:8080/owncloud',
 				'http://remoteserver:8080/owncloud/public.php/webdav/',
 			],
-			// extra slash
 			[
 				'http://remoteserver:8080/owncloud/',
 				'http://remoteserver:8080/owncloud/public.php/webdav/',
 			],
-			// extra path
 			[
 				'http://remoteserver:8080/myservices/owncloud/',
 				'http://remoteserver:8080/myservices/owncloud/public.php/webdav/',
 			],
-			// root path
 			[
 				'http://remoteserver:8080/',
 				'http://remoteserver:8080/public.php/webdav/',
 			],
-			// without port
 			[
 				'http://remoteserver/oc.test',
 				'http://remoteserver/oc.test/public.php/webdav/',
 			],
-			// https
 			[
 				'https://remoteserver/',
 				'https://remoteserver/public.php/webdav/',
@@ -183,6 +203,10 @@ class ExternalStorageTest extends \Test\TestCase {
 		];
 	}
 
+	// ---------------------------------------------------------------
+	// Basic tests (unchanged)
+	// ---------------------------------------------------------------
+
 	#[\PHPUnit\Framework\Attributes\DataProvider(methodName: 'optionsProvider')]
 	public function testStorageMountOptions($inputUri, $baseUri): void {
 		$storage = $this->getTestStorage($inputUri);
@@ -195,127 +219,516 @@ class ExternalStorageTest extends \Test\TestCase {
 		$this->assertSame(true, $result);
 	}
 
-	public function testRefreshBearerTokenUsesServerExpiry(): void {
-		$now = time();
-		$manager = $this->createMock(ExternalShareManager::class);
-		$manager->expects($this->once())
-			->method('getShareByToken')
-			->with('abcdef')
-			->willReturn(false);
-		$manager->expects($this->once())
-			->method('updateAccessToken')
-			->with(
-				'abcdef',
-				'fresh-access-token',
-				$this->callback(static fn (int $expiresAt): bool => $expiresAt >= $now + 86390 && $expiresAt <= $now + 86410)
-			);
+	// ---------------------------------------------------------------
+	// Mode-driven auth selection (replaces heuristic tests)
+	// ---------------------------------------------------------------
 
-		$storage = $this->getTestStorage('https://remoteserver', $manager);
-		$storage->setExchangeRefreshTokenResponse([
-			'accessToken' => 'fresh-access-token',
-			'expiresIn' => 86400,
-		]);
-
-		$this->assertTrue($storage->runRefreshBearerToken());
-		$this->assertSame('fresh-access-token', $storage->getBearerPassword());
-		$this->assertGreaterThanOrEqual($now + 86390, $storage->getTokenExpiry());
-	}
-
-	public function testRefreshBearerTokenFallsBackWhenExpiryMissing(): void {
-		$now = time();
-		$manager = $this->createMock(ExternalShareManager::class);
-		$manager->expects($this->once())
-			->method('getShareByToken')
-			->with('abcdef')
-			->willReturn(false);
-		$manager->expects($this->once())
-			->method('updateAccessToken')
-			->with(
-				'abcdef',
-				'fresh-access-token',
-				$this->callback(static fn (int $expiresAt): bool => $expiresAt >= $now + 3590 && $expiresAt <= $now + 3610)
-			);
-
-		$storage = $this->getTestStorage('https://remoteserver', $manager);
-		$storage->setExchangeRefreshTokenResponse([
-			'accessToken' => 'fresh-access-token',
-			'expiresIn' => null,
-		]);
-
-		$this->assertTrue($storage->runRefreshBearerToken());
-		$this->assertGreaterThanOrEqual($now + 3590, $storage->getTokenExpiry());
-	}
-
-	// These three cases lock the upgrade regression down:
-	// short legacy tokens must stay on basic auth, while long code-flow tokens
-	// may use bearer auth only when discovery also advertises exchange-token.
-	public function testLegacyShortTokenStaysBasicWithExchangeTokenCapability(): void {
-		$remote = 'https://legacy-share.example';
-		$storage = $this->getTestStorageWithGetBodies($remote, [
-			$remote . '/.well-known/ocm' => json_encode([
-				'enabled' => true,
-				'endPoint' => $remote . '/ocm',
-				'resourceTypes' => [[
-					'name' => 'file',
-					'shareTypes' => ['user'],
-					'protocols' => ['webdav' => '/public.php/webdav'],
-				]],
-				'capabilities' => ['shares', 'exchange-token'],
-			]),
-		]);
+	public function testLegacyModeUsesBasicAuth(): void {
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			null,
+			['token_exchange_mode' => TokenExchangeMode::LEGACY],
+		);
 
 		$this->assertFalse($storage->usesBearerAuth());
 	}
 
-	public function testExchangeTokenCapabilityUsesBearerForLongShareToken(): void {
-		$remote = 'https://codeflow-share.example';
+	public function testExchangeOptionalWithAccessTokenUsesBearer(): void {
 		$storage = $this->getTestStorageWithGetBodies(
-			$remote,
-			[
-				$remote . '/.well-known/ocm' => json_encode([
-					'enabled' => true,
-					'endPoint' => $remote . '/ocm',
-					'resourceTypes' => [[
-						'name' => 'file',
-						'shareTypes' => ['user'],
-						'protocols' => ['webdav' => '/public.php/webdav'],
-					]],
-					'capabilities' => ['shares', 'exchange-token'],
-				]),
-			],
+			'https://remote.example',
+			[],
 			null,
 			[
-				'token' => str_repeat('a', 32),
-			]
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'access_token' => 'stored-bearer',
+				'access_token_expires' => time() + 3600,
+			],
+		);
+
+		$this->assertTrue($storage->usesBearerAuth());
+		$this->assertSame('stored-bearer', $storage->getBearerPassword());
+	}
+
+	public function testNullModeDefaultsToBasicAuth(): void {
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+		);
+
+		$this->assertFalse($storage->usesBearerAuth());
+	}
+
+	public function testExchangeRequiredUsesBearer(): void {
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			null,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_REQUIRED,
+				'access_token' => 'required-bearer',
+				'access_token_expires' => time() + 3600,
+			],
 		);
 
 		$this->assertTrue($storage->usesBearerAuth());
 	}
 
-	public function testLongShareTokenWithoutExchangeTokenCapabilityStaysBasic(): void {
-		$remote = 'https://legacy-capability.example';
+	// ---------------------------------------------------------------
+	// Constructor guards
+	// ---------------------------------------------------------------
+
+	public function testConstructorDoesNotTriggerLazyResolutionOrTokenProbe(): void {
+		$this->mockResolver->expects($this->never())->method('ensureModeResolved');
+		$this->mockExchangeHelper->expects($this->never())->method('exchange');
+
+		$this->getTestStorageWithGetBodies('https://remote.example', []);
+	}
+
+	public function testLegacyPasswordRetainedRegardlessOfAuthType(): void {
 		$storage = $this->getTestStorageWithGetBodies(
-			$remote,
-			[
-				$remote . '/.well-known/ocm' => json_encode([
-					'enabled' => true,
-					'endPoint' => $remote . '/ocm',
-					'resourceTypes' => [[
-						'name' => 'file',
-						'shareTypes' => ['user'],
-						'protocols' => ['webdav' => '/public.php/webdav'],
-					]],
-					'capabilities' => ['shares'],
-				]),
-			],
+			'https://remote.example',
+			[],
 			null,
 			[
-				'token' => str_repeat('b', 32),
-			]
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'shared-secret',
+				'access_token' => 'bearer-tok',
+				'access_token_expires' => time() + 3600,
+			],
 		);
+
+		$this->assertSame('shared-secret', $storage->getLegacyPassword());
+		$this->assertSame('bearer-tok', $storage->getBearerPassword());
+	}
+
+	// ---------------------------------------------------------------
+	// init() lazy resolution
+	// ---------------------------------------------------------------
+
+	public function testInitTriggersLazyResolutionForNullMode(): void {
+		$share = new ExternalShare();
+		$share->setTokenExchangeMode(null);
+
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByIdInternal')
+			->with('42')
+			->willReturn($share);
+
+		$this->mockResolver->expects($this->once())
+			->method('ensureModeResolved')
+			->with($share)
+			->willReturn(new ResolutionResult(
+				ExchangeOutcome::DefinitiveNoCapability,
+				TokenExchangeMode::LEGACY,
+			));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			['share_id' => '42'],
+		);
+
+		$storage->runInit();
 
 		$this->assertFalse($storage->usesBearerAuth());
 	}
+
+	public function testInitDeletedRowThrowsStorageNotAvailable(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByIdInternal')
+			->with('42')
+			->willReturn(false);
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			['share_id' => '42'],
+		);
+
+		$this->expectException(StorageNotAvailableException::class);
+		$storage->runInit();
+	}
+
+	public function testInitResolutionWithBearerSetsAuthToBearer(): void {
+		$share = new ExternalShare();
+		$share->setTokenExchangeMode(null);
+
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByIdInternal')->willReturn($share);
+
+		$this->mockResolver->method('ensureModeResolved')
+			->willReturn(new ResolutionResult(
+				ExchangeOutcome::Success,
+				TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'resolved-bearer',
+				time() + 3600,
+			));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			['share_id' => '42'],
+		);
+
+		$storage->runInit();
+
+		$this->assertTrue($storage->usesBearerAuth());
+		$this->assertSame('resolved-bearer', $storage->getBearerPassword());
+	}
+
+	// ---------------------------------------------------------------
+	// init() opportunistic exchange gate
+	// ---------------------------------------------------------------
+
+	public function testInitOpportunisticExchangeSuccess(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->expects($this->once())
+			->method('updateAccessToken')
+			->with('abcdef', 'opp-bearer', $this->greaterThan(0));
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::success('opp-bearer', time() + 3600));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'legacy-pw',
+			],
+		);
+
+		$storage->runInit();
+
+		$this->assertTrue($storage->usesBearerAuth());
+		$this->assertSame('opp-bearer', $storage->getBearerPassword());
+	}
+
+	public function testInitOpportunisticExchangeFailureFallsBackToBasic(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->expects($this->never())->method('updateAccessToken');
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::TransientFailure));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'legacy-pw',
+			],
+		);
+
+		$storage->runInit();
+
+		$this->assertFalse($storage->usesBearerAuth());
+		$this->assertSame('legacy-pw', $storage->getBearerPassword());
+	}
+
+	// ---------------------------------------------------------------
+	// init() bearer-empty guard
+	// ---------------------------------------------------------------
+
+	public function testInitBearerEmptyGuardThrowsForExchangeRequired(): void {
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			null,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_REQUIRED,
+			],
+		);
+
+		$this->expectException(StorageNotAvailableException::class);
+		$storage->runInit();
+	}
+
+	// ---------------------------------------------------------------
+	// refreshBearerToken -- success
+	// ---------------------------------------------------------------
+
+	public function testRefreshBearerTokenSuccessStoresTokenAndExpiry(): void {
+		$now = time();
+		$expiresAt = $now + 86400;
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->with('abcdef')->willReturn(false);
+		$manager->expects($this->once())
+			->method('updateAccessToken')
+			->with('abcdef', 'fresh-access-token', $expiresAt);
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::success('fresh-access-token', $expiresAt));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'access_token' => 'stale-token',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('fresh-access-token', $storage->getBearerPassword());
+		$this->assertSame($expiresAt, $storage->getTokenExpiry());
+	}
+
+	public function testRefreshBearerTokenSuccessWithNullExpiryDefaultsToZero(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+		$manager->expects($this->once())
+			->method('updateAccessToken')
+			->with('abcdef', 'fresh-token', 0);
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::success('fresh-token', null));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame(0, $storage->getTokenExpiry());
+	}
+
+	// ---------------------------------------------------------------
+	// refreshBearerToken -- exchange-required fatal
+	// ---------------------------------------------------------------
+
+	public static function nonSuccessOutcomeProvider(): array {
+		return [
+			'definitive-invalid-grant' => [ExchangeOutcome::DefinitiveInvalidGrant],
+			'definitive-no-capability' => [ExchangeOutcome::DefinitiveNoCapability],
+			'explicit-invalid-request' => [ExchangeOutcome::ExplicitInvalidRequest],
+			'malformed-response' => [ExchangeOutcome::MalformedResponse],
+			'transient-failure' => [ExchangeOutcome::TransientFailure],
+		];
+	}
+
+	#[\PHPUnit\Framework\Attributes\DataProvider(methodName: 'nonSuccessOutcomeProvider')]
+	public function testRefreshExchangeRequiredThrowsOnNonSuccess(ExchangeOutcome $outcome): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+		$manager->expects($this->never())->method('updateModeAndClearBearer');
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure($outcome));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_REQUIRED,
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$this->expectException(StorageNotAvailableException::class);
+		$storage->runRefreshBearerToken();
+	}
+
+	// ---------------------------------------------------------------
+	// refreshBearerToken -- exchange-optional definitive downgrade
+	// ---------------------------------------------------------------
+
+	public function testRefreshOptionalDefinitiveInvalidGrantPersistsLegacy(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+		$manager->expects($this->once())
+			->method('updateModeAndClearBearer')
+			->with('abcdef', TokenExchangeMode::LEGACY);
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::DefinitiveInvalidGrant));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'legacy-pw',
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('legacy-pw', $storage->getBearerPassword());
+		$this->assertSame(TokenExchangeMode::LEGACY, $storage->getStoredTokenExchangeMode());
+	}
+
+	public function testRefreshOptionalDefinitiveNoCapabilityPersistsLegacy(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+		$manager->expects($this->once())
+			->method('updateModeAndClearBearer')
+			->with('abcdef', TokenExchangeMode::LEGACY);
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure(ExchangeOutcome::DefinitiveNoCapability));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'legacy-pw',
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('legacy-pw', $storage->getBearerPassword());
+	}
+
+	// ---------------------------------------------------------------
+	// refreshBearerToken -- exchange-optional non-definitive fallback
+	// ---------------------------------------------------------------
+
+	public static function nonDefinitiveOutcomeProvider(): array {
+		return [
+			'explicit-invalid-request' => [ExchangeOutcome::ExplicitInvalidRequest],
+			'malformed-response' => [ExchangeOutcome::MalformedResponse],
+			'transient-failure' => [ExchangeOutcome::TransientFailure],
+		];
+	}
+
+	#[\PHPUnit\Framework\Attributes\DataProvider(methodName: 'nonDefinitiveOutcomeProvider')]
+	public function testRefreshOptionalNonDefinitiveDoesNotPersistDowngrade(ExchangeOutcome $outcome): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+		$manager->expects($this->never())->method('updateModeAndClearBearer');
+
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::failure($outcome));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'legacy-pw',
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('legacy-pw', $storage->getBearerPassword());
+	}
+
+	// ---------------------------------------------------------------
+	// refreshBearerToken -- backoff window
+	// ---------------------------------------------------------------
+
+	public function testBackoffWindowExchangeOptionalReturnsTrueWithBasicFallback(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+
+		$this->mockExchangeHelper->expects($this->never())->method('exchange');
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'password' => 'legacy-pw',
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$storage->setRefreshBackoffUntil(time() + 60);
+
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('legacy-pw', $storage->getBearerPassword());
+	}
+
+	public function testBackoffWindowExchangeRequiredThrows(): void {
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->method('getShareByToken')->willReturn(false);
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://remote.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_REQUIRED,
+				'access_token' => 'stale',
+				'access_token_expires' => 0,
+			],
+		);
+
+		$storage->setRefreshBackoffUntil(time() + 60);
+
+		$this->expectException(StorageNotAvailableException::class);
+		$storage->runRefreshBearerToken();
+	}
+
+	// ---------------------------------------------------------------
+	// Concurrent refresh from DB
+	// ---------------------------------------------------------------
+
+	public function testForcedRefreshDoesNotReuseSameDbToken(): void {
+		$now = time();
+		$share = new ExternalShare();
+		$share->setAccessToken('stale-access-token');
+		$share->setAccessTokenExpires($now + 1800);
+
+		$manager = $this->createMock(ExternalShareManager::class);
+		$manager->expects($this->once())
+			->method('getShareByToken')
+			->with('abcdef')
+			->willReturn($share);
+		$manager->expects($this->once())
+			->method('updateAccessToken');
+
+		$expiresAt = $now + 1200;
+		$this->mockExchangeHelper->method('exchange')
+			->willReturn(ExchangeResult::success('fresh-access-token', $expiresAt));
+
+		$storage = $this->getTestStorageWithGetBodies(
+			'https://db-refresh.example',
+			[],
+			$manager,
+			[
+				'token_exchange_mode' => TokenExchangeMode::EXCHANGE_OPTIONAL,
+				'access_token' => 'stale-access-token',
+				'access_token_expires' => $now + 3600,
+			],
+		);
+
+		$storage->setForceTokenRefresh(true);
+		$this->assertTrue($storage->runRefreshBearerToken());
+		$this->assertSame('fresh-access-token', $storage->getBearerPassword());
+	}
+
+	// ---------------------------------------------------------------
+	// Remote check tests (unchanged)
+	// ---------------------------------------------------------------
 
 	public function testOwnCloudStatusDetectionRejectsRevaProduct(): void {
 		$remote = 'https://remoteserver';
@@ -389,128 +802,43 @@ class ExternalStorageTest extends \Test\TestCase {
 		$this->assertTrue($storage->runRemoteCheck());
 	}
 
-	public function testWithAuthRetryForcesRefreshAfter401WithLocallyValidToken(): void {
-		$manager = $this->createMock(ExternalShareManager::class);
-		$manager->expects($this->once())
-			->method('getShareByToken')
-			->with('abcdef')
-			->willReturn(false);
-		$manager->expects($this->once())
-			->method('updateAccessToken')
-			->with(
-				'abcdef',
-				'fresh-access-token',
-				$this->greaterThan(time())
-			);
+	// ---------------------------------------------------------------
+	// Static guard: no token-length heuristics in Storage.php
+	// ---------------------------------------------------------------
 
-		$storage = $this->getTestStorageWithGetBodies(
-			'https://forced-refresh.example',
-			[],
-			$manager,
-			[
-				'access_token' => 'stale-access-token',
-				'access_token_expires' => time() + 3600,
-			]
+	public function testStorageSourceDoesNotContainTokenLengthHeuristic(): void {
+		$source = file_get_contents(__DIR__ . '/../lib/External/Storage.php');
+		$this->assertStringNotContainsString('shareTokenSupportsExchange', $source);
+		$this->assertStringNotContainsString('REFRESH_MAX_ATTEMPTS', $source);
+		$this->assertFalse(
+			(bool)preg_match('/strlen\s*\(\s*\$.*token/i', $source),
+			'Storage.php must not use strlen on token for auth policy',
 		);
-		$storage->setExchangeRefreshTokenResponse([
-			'accessToken' => 'fresh-access-token',
-			'expiresIn' => 1200,
-		]);
-
-		$attempts = 0;
-		$result = $storage->runWithAuthRetry(function () use (&$attempts) {
-			$attempts++;
-			if ($attempts === 1) {
-				throw new ClientException(
-					'unauthorized',
-					new Request('GET', 'https://forced-refresh.example/remote.php/dav/files/test'),
-					new Psr7Response(401)
-				);
-			}
-
-			return 'retried-ok';
-		});
-
-		$this->assertSame('retried-ok', $result);
-		$this->assertSame(2, $attempts);
-		$this->assertSame('fresh-access-token', $storage->getBearerPassword());
-	}
-
-	public function testForcedRefreshDoesNotReuseSameDbToken(): void {
-		$now = time();
-		$share = new \OCA\Files_Sharing\External\ExternalShare();
-		$share->setAccessToken('stale-access-token');
-		$share->setAccessTokenExpires($now + 1800);
-
-		$manager = $this->createMock(ExternalShareManager::class);
-		$manager->expects($this->once())
-			->method('getShareByToken')
-			->with('abcdef')
-			->willReturn($share);
-		$manager->expects($this->once())
-			->method('updateAccessToken')
-			->with(
-				'abcdef',
-				'fresh-access-token',
-				$this->callback(static fn (int $expiresAt): bool => $expiresAt >= $now + 1190 && $expiresAt <= $now + 1210)
-			);
-
-		$storage = $this->getTestStorageWithGetBodies(
-			'https://db-refresh.example',
-			[],
-			$manager,
-			[
-				'access_token' => 'stale-access-token',
-				'access_token_expires' => $now + 3600,
-			]
-		);
-		$storage->setExchangeRefreshTokenResponse([
-			'accessToken' => 'fresh-access-token',
-			'expiresIn' => 1200,
-		]);
-
-		$this->assertSame('retried-ok', $storage->runWithAuthRetry(function () {
-			static $attempt = 0;
-			$attempt++;
-			if ($attempt === 1) {
-				throw new ClientException(
-					'unauthorized',
-					new Request('GET', 'https://db-refresh.example/remote.php/dav/files/test'),
-					new Psr7Response(401)
-				);
-			}
-
-			return 'retried-ok';
-		}));
-		$this->assertSame('fresh-access-token', $storage->getBearerPassword());
-	}
-
-	public function testRefreshBearerTokenRejectsMissingAccessTokenInResponse(): void {
-		$manager = $this->createMock(ExternalShareManager::class);
-		$manager->expects($this->once())
-			->method('getShareByToken')
-			->with('abcdef')
-			->willReturn(false);
-		$manager->expects($this->never())->method('updateAccessToken');
-
-		$storage = $this->getTestStorage('https://malformed-response.example', $manager);
-		$storage->setExchangeRefreshTokenResponse([
-			'expiresIn' => 3600,
-		]);
-
-		$this->assertFalse($storage->runRefreshBearerToken());
 	}
 }
 
 /**
- * Dummy subclass to make it possible to access private members
+ * Test subclass exposing internal Storage state and providing mock injection seams.
  */
 class TestSharingExternalStorage extends Storage {
-	/** @var array{accessToken: string, expiresIn: ?int} */
-	private array $exchangeResponse = [
-		'accessToken' => 'fresh-access-token',
-		'expiresIn' => null,
-	];
+	private static ?TokenExchangeModeResolver $testResolver = null;
+	private static ?TokenExchangeHelper $testExchangeHelper = null;
+
+	public static function setTestResolver(?TokenExchangeModeResolver $resolver): void {
+		self::$testResolver = $resolver;
+	}
+
+	public static function setTestExchangeHelper(?TokenExchangeHelper $helper): void {
+		self::$testExchangeHelper = $helper;
+	}
+
+	protected function createResolver(): TokenExchangeModeResolver {
+		return self::$testResolver ?? parent::createResolver();
+	}
+
+	protected function createExchangeHelper(): TokenExchangeHelper {
+		return self::$testExchangeHelper ?? parent::createExchangeHelper();
+	}
 
 	public function getBaseUri() {
 		return $this->createBaseUri();
@@ -523,8 +851,8 @@ class TestSharingExternalStorage extends Storage {
 		return parent::stat($path);
 	}
 
-	public function setExchangeRefreshTokenResponse(array $response): void {
-		$this->exchangeResponse = $response;
+	public function runInit(): void {
+		$this->init();
 	}
 
 	public function runRefreshBearerToken(): bool {
@@ -535,8 +863,26 @@ class TestSharingExternalStorage extends Storage {
 		return $this->password;
 	}
 
+	public function getLegacyPassword(): string {
+		return \Closure::bind(fn (): string => $this->legacyPassword, $this, Storage::class)();
+	}
+
 	public function getTokenExpiry(): int {
 		return \Closure::bind(fn (): int => $this->tokenExpiresAt, $this, Storage::class)();
+	}
+
+	public function getStoredTokenExchangeMode(): ?string {
+		return \Closure::bind(fn (): ?string => $this->tokenExchangeMode, $this, Storage::class)();
+	}
+
+	public function setRefreshBackoffUntil(int $timestamp): void {
+		\Closure::bind(function () use ($timestamp): void {
+			$this->refreshBackoffUntil = $timestamp;
+		}, $this, Storage::class)();
+	}
+
+	public function setForceTokenRefresh(bool $force): void {
+		$this->forceTokenRefresh = $force;
 	}
 
 	public function runOwnCloudStatusCheck(): bool {
@@ -557,9 +903,5 @@ class TestSharingExternalStorage extends Storage {
 
 	public function usesBearerAuth(): bool {
 		return $this->isBearerAuth();
-	}
-
-	protected function exchangeRefreshTokenResponse(): array {
-		return $this->exchangeResponse;
 	}
 }

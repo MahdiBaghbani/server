@@ -117,6 +117,8 @@ class Manager {
 			'access_token_expires' => $externalShare->getAccessTokenExpires(),
 			'mountpoint' => $externalShare->getMountpoint(),
 			'owner' => $externalShare->getOwner(),
+			'share_id' => (string)$externalShare->getId(),
+			'token_exchange_mode' => $externalShare->getTokenExchangeMode(),
 			'verify' => !$this->config->getSystemValueBool('sharing.federation.allowSelfSignedCertificates'),
 		];
 		return $this->mountShare($options, $user);
@@ -177,6 +179,18 @@ class Manager {
 	}
 
 	/**
+	 * Session-free read for Storage to load a mounted row before calling the
+	 * resolver. No user or access check -- caller must already hold the row id.
+	 */
+	public function getShareByIdInternal(string $id): ExternalShare|false {
+		try {
+			return $this->externalShareMapper->getById($id);
+		} catch (DoesNotExistException) {
+			return false;
+		}
+	}
+
+	/**
 	 * @throws Exception
 	 */
 	private function updateSubShare(ExternalShare $externalShare, IUser $user, ?string $mountPoint, int $accepted): ExternalShare {
@@ -203,6 +217,7 @@ class Manager {
 				$subShare->setParent((string)$externalShare->getId());
 				$subShare->setShareType($externalShare->getShareType());
 				$subShare->setShareToken($externalShare->getShareToken());
+				$subShare->setTokenExchangeMode($externalShare->getTokenExchangeMode());
 				$this->externalShareMapper->insert($subShare);
 			}
 		}
@@ -254,6 +269,7 @@ class Manager {
 		} else {
 			try {
 				$this->updateSubShare($externalShare, $user, $mountPoint, IShare::STATUS_ACCEPTED);
+				$this->eventDispatcher->dispatchTyped(new InvalidateMountCacheEvent($user));
 				$result = true;
 			} catch (Exception $e) {
 				$this->logger->emergency('Could not create sub-share', ['exception' => $e]);
@@ -299,6 +315,7 @@ class Manager {
 		} elseif ($externalShare->getShareType() === IShare::TYPE_GROUP) {
 			try {
 				$this->updateSubShare($externalShare, $user, null, IShare::STATUS_PENDING);
+				$this->eventDispatcher->dispatchTyped(new InvalidateMountCacheEvent($user));
 				$result = true;
 			} catch (Exception $e) {
 				$this->logger->emergency('Could not create sub-share', ['exception' => $e]);
@@ -593,6 +610,31 @@ class Manager {
 			$this->logger->warning('Could not find share to update access token', ['shareToken' => substr($shareToken, 0, 8) . '...']);
 		} catch (Exception $e) {
 			$this->logger->error('Failed to update access token', ['exception' => $e]);
+		}
+	}
+
+	/**
+	 * Persist a mode downgrade and clear bearer state for all rows sharing the
+	 * same share_token. Used by Storage::refreshBearerToken() on definitive
+	 * invalid-grant or no-capability outcomes.
+	 */
+	public function updateModeAndClearBearer(string $shareToken, string $mode): void {
+		try {
+			$updatedRows = $this->externalShareMapper->updateModeAndClearBearerByShareToken($shareToken, $mode);
+			if ($updatedRows === 0) {
+				$this->logger->warning('Could not find share to update mode and clear bearer', ['shareToken' => substr($shareToken, 0, 8) . '...']);
+				return;
+			}
+
+			$this->logger->debug('Updated mode and cleared bearer for share rows', [
+				'shareToken' => substr($shareToken, 0, 8) . '...',
+				'mode' => $mode,
+				'updatedRows' => $updatedRows,
+			]);
+		} catch (DoesNotExistException $e) {
+			$this->logger->warning('Could not find share to update mode and clear bearer', ['shareToken' => substr($shareToken, 0, 8) . '...']);
+		} catch (Exception $e) {
+			$this->logger->error('Failed to update mode and clear bearer', ['exception' => $e]);
 		}
 	}
 }
