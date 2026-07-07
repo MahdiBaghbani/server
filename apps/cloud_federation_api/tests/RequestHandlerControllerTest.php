@@ -12,8 +12,6 @@ namespace OCA\CloudFederationApi\Tests;
 use OC\Federation\CloudFederationNotification;
 use OCA\CloudFederationAPI\Config;
 use OCA\CloudFederationAPI\Controller\RequestHandlerController;
-use OCA\CloudFederationAPI\Db\FederatedInvite;
-use OCA\CloudFederationAPI\Db\FederatedInviteMapper;
 use OCP\AppFramework\Http;
 use OCP\AppFramework\Http\JSONResponse;
 use OCP\AppFramework\Utility\ITimeFactory;
@@ -45,7 +43,6 @@ class RequestHandlerControllerTest extends TestCase {
 	private ICloudFederationProviderManager&MockObject $cloudFederationProviderManager;
 	private Config&MockObject $config;
 	private IEventDispatcher&MockObject $eventDispatcher;
-	private FederatedInviteMapper&MockObject $federatedInviteMapper;
 	private IAppConfig&MockObject $appConfig;
 
 	private ICloudFederationFactory&MockObject $cloudFederationFactory;
@@ -66,7 +63,6 @@ class RequestHandlerControllerTest extends TestCase {
 		$this->cloudFederationProviderManager = $this->createMock(ICloudFederationProviderManager::class);
 		$this->config = $this->createMock(Config::class);
 		$this->eventDispatcher = $this->createMock(IEventDispatcher::class);
-		$this->federatedInviteMapper = $this->createMock(FederatedInviteMapper::class);
 		$this->appConfig = $this->createMock(IAppConfig::class);
 		$this->cloudFederationFactory = $this->createMock(ICloudFederationFactory::class);
 		$this->cloudIdManager = $this->createMock(ICloudIdManager::class);
@@ -83,53 +79,12 @@ class RequestHandlerControllerTest extends TestCase {
 			$this->cloudFederationProviderManager,
 			$this->config,
 			$this->eventDispatcher,
-			$this->federatedInviteMapper,
 			$this->appConfig,
 			$this->cloudFederationFactory,
 			$this->cloudIdManager,
 			$this->discoveryService,
 			$this->timeFactory,
 		);
-	}
-
-	public function testInviteAccepted(): void {
-		$token = 'token';
-		$userId = 'userId';
-		$invite = new FederatedInvite();
-		$invite->setCreatedAt(1);
-		$invite->setUserId($userId);
-		$invite->setToken($token);
-
-		$this->federatedInviteMapper->expects(self::once())
-			->method('findByToken')
-			->with($token)
-			->willReturn($invite);
-
-		$this->federatedInviteMapper->expects(self::once())
-			->method('update')
-			->willReturnArgument(0);
-
-		$user = $this->createMock(IUser::class);
-		$user->method('getUID')
-			->willReturn($userId);
-		$user->method('getEMailAddress')
-			->willReturn('email');
-		$user->method('getDisplayName')
-			->willReturn('displayName');
-
-		$this->userManager->expects(self::once())
-			->method('get')
-			->with($userId)
-			->willReturn($user);
-
-		$recipientProvider = 'http://127.0.0.1';
-		$recipientId = 'remote';
-		$recipientEmail = 'remote@example.org';
-		$recipientName = 'Remote Remoteson';
-		$response = ['userID' => $userId, 'email' => 'email', 'name' => 'displayName'];
-		$json = new JSONResponse($response, Http::STATUS_OK);
-
-		$this->assertEquals($json, $this->requestHandlerController->inviteAccepted($recipientProvider, $token, $recipientId, $recipientEmail, $recipientName));
 	}
 
 	public function testNotificationReceived(): void {
